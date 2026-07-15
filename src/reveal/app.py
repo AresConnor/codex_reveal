@@ -47,9 +47,36 @@ TabPane {
     width: 1fr;
     height: 1fr;
 }
-
 RichLog {
     width: 1fr;
+    height: 1fr;
+    scrollbar-size: 1 1;
+}
+
+#live Horizontal {
+    height: 1fr;
+}
+
+#live #sse-log {
+    width: 1fr;
+}
+
+#agent-sidebar {
+    width: 34;
+    height: 1fr;
+    border-left: solid $primary-background;
+    background: $surface;
+}
+
+#agent-title {
+    height: 1;
+    background: $primary-background;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+}
+
+#agent-filter {
     height: 1fr;
     scrollbar-size: 1 1;
 }
