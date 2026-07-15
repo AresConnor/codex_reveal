@@ -1,0 +1,4 @@
+```powershell
+uv run reveal
+```
+
