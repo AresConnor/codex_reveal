@@ -74,6 +74,17 @@ class LogView(Container):
         diag_log.write("[bold green]Diagnostics[/] — response integrity + speed analysis")
         diag_log.write("[dim]Detects: WS padding, token inflation, invisible chars, burst dumping, TPS anomalies[/]")
 
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
+        """Force relayout when switching tabs to fix width recalculation."""
+        pane = event.pane
+        if pane is None:
+            return
+        try:
+            log = pane.query_one(RichLog)
+            log.refresh()
+        except Exception:
+            pass
+
     def load_session(self, meta: SessionMeta):
         """Load a session's rollout history into the History tab."""
         self._active_session = meta

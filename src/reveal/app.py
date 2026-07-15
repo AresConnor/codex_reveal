@@ -39,14 +39,17 @@ Screen {
 }
 
 TabbedContent {
+    width: 1fr;
     height: 1fr;
 }
 
 TabPane {
+    width: 1fr;
     height: 1fr;
 }
 
 RichLog {
+    width: 1fr;
     height: 1fr;
     scrollbar-size: 1 1;
 }
