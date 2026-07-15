@@ -65,7 +65,9 @@ class LogView(Container):
         self._stream_text: dict[str, str] = {}   # response_id -> text
         self._stream_tool: dict[str, str] = {}   # response_id -> tool input
         self._stream_last_rid: str = ""
-
+        # Buffer SSE events while Live SSE tab is not visible
+        self._sse_buffer: list[SSEEvent] = []
+        self._sse_active: bool = True
         sse_log = self.query_one("#sse-log", RichLog)
         sse_log.write("[bold green]Reveal[/] — waiting for SSE events...")
         sse_log.write(f"[dim]Database: {self._sse.db_path}[/]")
@@ -81,11 +83,24 @@ class LogView(Container):
         except Exception:
             return
         active = tabs.active
+        # Track whether Live SSE tab is visible
+        self._sse_active = (active == "live")
         if active == "diagnostics":
             # Re-render diagnostics at correct width after layout settles
             self.call_after_refresh(self._refresh_diagnostics)
             # Fallback timer in case call_after_refresh fires too early
             self.set_timer(0.1, self._refresh_diagnostics)
+        elif active == "live":
+            # Flush buffered SSE events at correct width after layout settles
+            def _flush_sse():
+                sse_log = self.query_one("#sse-log", RichLog)
+                if self._sse_buffer and sse_log.size.width > 1:
+                    for ev in self._sse_buffer:
+                        self._write_sse_event(sse_log, ev)
+                    self._sse_buffer.clear()
+                    self._flush_stream(sse_log, final=False)
+            self.call_after_refresh(_flush_sse)
+            self.set_timer(0.1, _flush_sse)
         else:
             try:
                 pane = event.pane
@@ -128,16 +143,27 @@ class LogView(Container):
 
         self._history_event_count = len(events)
         hist_log.write(f"\n[dim]{'─' * 40}[/]")
-        hist_log.write(f"[dim]End of session ({self._history_event_count} events)[/]")
 
     def poll_sse(self):
         """Poll for new SSE events and update all views."""
         sse_log = self.query_one("#sse-log", RichLog)
         events = self._sse.poll()
 
+        # Always feed analyzer (diagnostics must track even when tab hidden)
         for ev in events:
-            self._write_sse_event(sse_log, ev)
             self._analyzer.feed(ev)
+
+        # Buffer events if Live SSE tab is not visible or has no width
+        if not self._sse_active or sse_log.size.width <= 1:
+            self._sse_buffer.extend(events)
+        else:
+            # Flush any buffered events first
+            if self._sse_buffer:
+                for ev in self._sse_buffer:
+                    self._write_sse_event(sse_log, ev)
+                self._sse_buffer.clear()
+            for ev in events:
+                self._write_sse_event(sse_log, ev)
 
         if events:
             self._flush_stream(sse_log, final=False)
