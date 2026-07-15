@@ -76,6 +76,7 @@ class RevealApp(App):
         Binding("shift+tab", "focus_previous", "Prev Panel", show=False),
         Binding("l", "tab('live')", "Live SSE", show=True),
         Binding("h", "tab('history')", "History", show=True),
+        Binding("d", "tab('diagnostics')", "Diagnostics", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -139,7 +140,7 @@ class RevealApp(App):
             f" SSE events: {sse_total}"
         )
         self.query_one("#status-right", Label).update(
-            " Ctrl+R Refresh  |  L Live  |  H History  |  Ctrl+Q Quit"
+            " Ctrl+R Refresh  |  L Live  H Hist  D Diag  |  Ctrl+Q Quit"
         )
 
     def _set_status(self, msg: str):

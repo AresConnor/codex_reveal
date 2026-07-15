@@ -12,6 +12,7 @@ from textual.reactive import reactive
 from ..sources.sse import SSESource, SSEEvent
 from ..sources.rollout import read_rollout
 from ..models import SessionMeta
+from ..diagnostics import ResponseAnalyzer
 CST = timezone(timedelta(hours=8))
 
 
@@ -44,13 +45,21 @@ class LogView(Container):
                     id="history-log",
                     highlight=True,
                     markup=True,
+                    min_width=40,
+                )
+            with TabPane("Diagnostics", id="diagnostics"):
+                yield RichLog(
+                    id="diag-log",
+                    highlight=True,
+                    markup=True,
                     wrap=True,
                     min_width=40,
                 )
 
     def on_mount(self):
         self._sse = SSESource()
-        # Start with a welcome message
+        self._analyzer = ResponseAnalyzer()
+
         sse_log = self.query_one("#sse-log", RichLog)
         sse_log.write("[bold green]Reveal[/] — waiting for SSE events...")
         sse_log.write(f"[dim]Database: {self._sse.db_path}[/]")
@@ -58,6 +67,10 @@ class LogView(Container):
 
         hist_log = self.query_one("#history-log", RichLog)
         hist_log.write("[bold green]Select a session from the sidebar[/] to view its history.")
+
+        diag_log = self.query_one("#diag-log", RichLog)
+        diag_log.write("[bold green]Diagnostics[/] — analyzing response integrity...")
+        diag_log.write("[dim]Watching for: whitespace padding, token inflation, invisible chars, repeated content[/]")
 
     def load_session(self, meta: SessionMeta):
         """Load a session's rollout history into the History tab."""
@@ -92,12 +105,86 @@ class LogView(Container):
         hist_log.write(f"[dim]End of session ({len(events)} events)[/]")
 
     def poll_sse(self):
-        """Poll for new SSE events and write them to the Live SSE log."""
+        """Poll for new SSE events and update all views."""
         sse_log = self.query_one("#sse-log", RichLog)
         events = self._sse.poll()
 
         for ev in events:
             self._write_sse_event(sse_log, ev)
+            self._analyzer.feed(ev)
+
+        if events:
+            self._refresh_diagnostics()
+
+    def _refresh_diagnostics(self):
+        """Update the Diagnostics tab with current analyzer state."""
+        diag_log = self.query_one("#diag-log", RichLog)
+        a = self._analyzer
+
+        # Only redraw if there's something meaningful
+        if a.active_count == 0 and not a.completed:
+            return
+
+        diag_log.clear()
+
+        # ── Summary bar ──────────────────────────────────────────────
+        ws_pct = a.overall_whitespace_ratio * 100
+        ws_color = "red" if ws_pct > 25 else ("yellow" if ws_pct > 10 else "green")
+
+        diag_log.write(
+            f"[bold]Overall WS%:[/] [{ws_color}]{ws_pct:.1f}%[/]  "
+            f"[bold]Suspicious:[/] [bold red]{a.total_suspicious}[/]  "
+            f"[bold]Active:[/] {a.active_count}  "
+            f"[bold]Completed:[/] {len(a.completed)}"
+        )
+        diag_log.write("")
+
+        # ── Recent suspicious responses ──────────────────────────────
+        suspicious = a.recent_suspicious(20)
+        if suspicious:
+            diag_log.write("[bold underline]Recent Suspicious Responses:[/]")
+            diag_log.write(
+                f"  {'Model':<12} {'Score':>5} {'WS%':>6} {'Tok×':>6} "
+                f"{'Chars':>7} {'Flags':<20}"
+            )
+            for rs in reversed(suspicious):
+                score = rs.suspicion_score
+                sc_color = "red" if score >= 50 else ("yellow" if score >= 25 else "dim")
+                flags_str = " ".join(rs.flags[:4])
+                diag_log.write(
+                    f"  {rs.model:<12} [{sc_color}]{score:>3}[/]  "
+                    f"{rs.whitespace_ratio:>5.0%}  "
+                    f"{rs.token_inflation:>5.1f}  "
+                    f"{rs.total_chars:>6}  "
+                    f"[dim]{flags_str:<20}[/]"
+                )
+                # Show samples for high-score responses
+                if score >= 30 and rs.suspicious_samples:
+                    for sample in rs.suspicious_samples[:2]:
+                        diag_log.write(f"    [red]![/] [dim]{sample}[/]")
+            diag_log.write("")
+
+        # ── Active responses snapshot ────────────────────────────────
+        if a.responses:
+            diag_log.write("[bold underline]In-Flight:[/]")
+            for rid, rs in a.responses.items():
+                if rs.delta_count == 0:
+                    continue
+                ws_pct_r = rs.whitespace_ratio * 100
+                ws_c = "red" if ws_pct_r > 25 else ("yellow" if ws_pct_r > 10 else "dim")
+                diag_log.write(
+                    f"  {rs.model:<12} "
+                    f"δ={rs.delta_count:<4} chars={rs.total_chars:<6} "
+                    f"ws=[{ws_c}]{ws_pct_r:.0f}%[/]"
+                    + (f" [bold red]⚠ {rs.high_whitespace_deltas} dirty δ[/]" if rs.high_whitespace_deltas > 0 else "")
+                )
+
+        # ── Footer hint ──────────────────────────────────────────────
+        diag_log.write("")
+        diag_log.write(
+            "[dim]Legend: WS% = whitespace ratio  |  Tok× = reported/estimated tokens  "
+            "|  δ = deltas  |  WSδ = dirty deltas (>80% ws)[/]"
+        )
 
     def _write_event_msg(self, log: RichLog, payload: dict):
         ptype = payload.get("type", "")
