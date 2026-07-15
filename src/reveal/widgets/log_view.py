@@ -75,16 +75,26 @@ class LogView(Container):
         hist_log.write("[bold green]Select a session from the sidebar[/] to view its history.")
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
-        """Force relayout after tab switch — use deferred timer for reliability."""
-        pane = event.pane
-        if pane is None:
-            return
+        """Re-render content on tab switch to fix width issues."""
         try:
-            log = pane.query_one(RichLog)
-            # Let layout settle, then force refresh
-            self.set_timer(0.05, lambda: log.refresh(layout=True))
+            tabs = self.query_one(TabbedContent)
         except Exception:
-            pass
+            return
+        active = tabs.active
+        if active == "diagnostics":
+            # Re-render diagnostics at correct width after layout settles
+            self.call_after_refresh(self._refresh_diagnostics)
+            # Fallback timer in case call_after_refresh fires too early
+            self.set_timer(0.1, self._refresh_diagnostics)
+        else:
+            try:
+                pane = event.pane
+                if pane is not None:
+                    log = pane.query_one(RichLog)
+                    self.call_after_refresh(lambda: log.refresh(layout=True))
+                    self.set_timer(0.1, lambda: log.refresh(layout=True))
+            except Exception:
+                pass
 
     def load_session(self, meta: SessionMeta):
         """Load a session's rollout history into the History tab."""
@@ -170,6 +180,10 @@ class LogView(Container):
         if a.active_count == 0 and not a.completed:
             return
 
+        # Skip if widget has no real width (tab not visible / layout pending)
+        if diag_log.size.width <= 1:
+            return
+
         diag_log.clear()
 
         # ── Summary bar ──────────────────────────────────────────────
@@ -189,26 +203,21 @@ class LogView(Container):
         if suspicious:
             diag_log.write("[bold underline]Recent Suspicious Responses:[/]")
             diag_log.write(
-                f"  {'Model':<12} {'Eff':<5} {'Sc':>3} {'WS%':>5} {'TWS%':>5} "
-                f"{'Tok×':>5} {'TPS':>6} {'δ/s':>6} {'Flags'}"
+                f"  {'Model':<15} {'Effort':<7} {'Sc':>3}  "
+                f"{'WS%':>5}  {'TWS%':>5}  {'Tokx':>5}  "
+                f"{'TPS':>6}  {'d/s':>6}  {'Flags'}"
             )
             for rs in reversed(suspicious):
                 score = rs.suspicion_score
-                if score >= 50:
-                    sc_str = f"!!{score}"
-                elif score >= 25:
-                    sc_str = f"!{score}"
-                else:
-                    sc_str = str(score)
                 flags_str = " ".join(rs.flags[:4])
-                effort = (rs.reasoning_effort or "-")[:5]
+                effort = (rs.reasoning_effort or "-")[:7]
                 diag_log.write(
-                    f"  {rs.model:<12} {effort:<5} {sc_str:>3}  "
-                    f"{rs.whitespace_ratio:>4.0%}  "
-                    f"{rs.tool_ws_ratio:>4.0%}  "
-                    f"{rs.token_inflation:>4.1f}  "
-                    f"{rs.effective_tps:>5.0f}  "
-                    f"{rs.deltas_per_second:>5.0f}  "
+                    f"  {rs.model:<15} {effort:<7} {score:>3}  "
+                    f"{rs.whitespace_ratio:>5.0%}  "
+                    f"{rs.tool_ws_ratio:>5.0%}  "
+                    f"{rs.token_inflation:>5.1f}  "
+                    f"{rs.effective_tps:>6.0f}  "
+                    f"{rs.deltas_per_second:>6.0f}  "
                     f"{flags_str}"
                 )
                 if score >= 30 and rs.suspicious_samples:
