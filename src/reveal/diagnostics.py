@@ -39,7 +39,9 @@ class ResponseStats:
     delta_count: int = 0
     text_delta_count: int = 0
     tool_input_delta_count: int = 0
-
+    # Tool-input-specific whitespace tracking (separate from text)
+    tool_ws_chars: int = 0
+    tool_content_chars: int = 0
     # Token metrics (from response.completed)
     reported_output_tokens: int = 0
     reported_input_tokens: int = 0
@@ -98,6 +100,13 @@ class ResponseStats:
         return 0.0
 
     @property
+    def tool_ws_ratio(self) -> float:
+        """Whitespace ratio in tool call inputs specifically."""
+        total = self.tool_ws_chars + self.tool_content_chars
+        if total == 0:
+            return 0.0
+        return self.tool_ws_chars / total
+    @property
     def token_inflation(self) -> float:
         """Ratio of reported tokens to estimated tokens."""
         if self.estimated_tokens == 0:
@@ -137,6 +146,8 @@ class ResponseStats:
         f = []
         if self.whitespace_ratio > 0.3:
             f.append(f"WS:{self.whitespace_ratio:.0%}")
+        if self.tool_ws_ratio > 0.3:
+            f.append(f"TWS:{self.tool_ws_ratio:.0%}")
         if self.token_inflation > TOKEN_INFLATION_RATIO:
             f.append(f"TOK:{self.token_inflation:.1f}x")
         if self.high_whitespace_deltas > 0:
@@ -243,7 +254,8 @@ class ResponseAnalyzer:
             rs.text_delta_count += 1
         else:
             rs.tool_input_delta_count += 1
-
+            rs.tool_ws_chars += ws
+            rs.tool_content_chars += content
         # ── Timing tracking (per-delta arrival) ───────────────────────
         if ts > 0 and kind == "text":
             rs.delta_timestamps.append(ts)

@@ -61,9 +61,10 @@ class LogView(Container):
         self._analyzer = ResponseAnalyzer()
         self._active_session: SessionMeta | None = None
         self._history_event_count: int = 0
-        # Streaming state for append-mode text display
-        self._stream_text: dict[str, str] = {}  # response_id -> accumulated text
-        self._stream_last_rid: str = ""          # last response we wrote text for
+        # Streaming state for append-mode text/tool display
+        self._stream_text: dict[str, str] = {}   # response_id -> text
+        self._stream_tool: dict[str, str] = {}   # response_id -> tool input
+        self._stream_last_rid: str = ""
 
         sse_log = self.query_one("#sse-log", RichLog)
         sse_log.write("[bold green]Reveal[/] — waiting for SSE events...")
@@ -73,19 +74,15 @@ class LogView(Container):
         hist_log = self.query_one("#history-log", RichLog)
         hist_log.write("[bold green]Select a session from the sidebar[/] to view its history.")
 
-        diag_log = self.query_one("#diag-log", RichLog)
-        diag_log.write("[bold green]Diagnostics[/] — response integrity + speed analysis")
-        diag_log.write("[dim]Detects: WS padding, token inflation, invisible chars, burst dumping, TPS anomalies[/]")
-
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
-        """Force relayout after tab switch — wait for layout cycle to complete."""
+        """Force relayout after tab switch — use deferred timer for reliability."""
         pane = event.pane
         if pane is None:
             return
         try:
             log = pane.query_one(RichLog)
-            # Defer to after the current layout refresh cycle
-            self.call_after_refresh(lambda: log.refresh(layout=True))
+            # Let layout settle, then force refresh
+            self.set_timer(0.05, lambda: log.refresh(layout=True))
         except Exception:
             pass
 
@@ -192,25 +189,31 @@ class LogView(Container):
         if suspicious:
             diag_log.write("[bold underline]Recent Suspicious Responses:[/]")
             diag_log.write(
-                f"  {'Model':<12} {'Effort':<6} {'Sc':>3} {'WS%':>5} {'Tok×':>5} "
-                f"{'TPS':>6} {'δ/s':>6} {'Flags'}"
+                f"  {'Model':<12} {'Eff':<5} {'Sc':>3} {'WS%':>5} {'TWS%':>5} "
+                f"{'Tok×':>5} {'TPS':>6} {'δ/s':>6} {'Flags'}"
             )
             for rs in reversed(suspicious):
                 score = rs.suspicion_score
-                sc_color = "red" if score >= 50 else ("yellow" if score >= 25 else "dim")
+                if score >= 50:
+                    sc_str = f"!!{score}"
+                elif score >= 25:
+                    sc_str = f"!{score}"
+                else:
+                    sc_str = str(score)
                 flags_str = " ".join(rs.flags[:4])
-                effort = rs.reasoning_effort[:6] if rs.reasoning_effort else "-"
+                effort = (rs.reasoning_effort or "-")[:5]
                 diag_log.write(
-                    f"  {rs.model:<12} {effort:<6} [{sc_color}]{score:>2}[/]  "
+                    f"  {rs.model:<12} {effort:<5} {sc_str:>3}  "
                     f"{rs.whitespace_ratio:>4.0%}  "
+                    f"{rs.tool_ws_ratio:>4.0%}  "
                     f"{rs.token_inflation:>4.1f}  "
                     f"{rs.effective_tps:>5.0f}  "
                     f"{rs.deltas_per_second:>5.0f}  "
-                    f"[dim]{flags_str}[/]"
+                    f"{flags_str}"
                 )
                 if score >= 30 and rs.suspicious_samples:
                     for sample in rs.suspicious_samples[:2]:
-                        diag_log.write(f"    [red]![/] [dim]{sample}[/]")
+                        diag_log.write(f"    [red]![/] {sample}")
             diag_log.write("")
 
         # ── Active responses snapshot ────────────────────────────────
@@ -285,6 +288,7 @@ class LogView(Container):
             reasoning = resp_data.get("reasoning", {}).get("effort", "?")
             self._stream_last_rid = rid
             self._stream_text.pop(rid, None)
+            self._stream_tool.pop(rid, None)
             log.write(f"\n[bold cyan]{'━' * 60}[/]")
             log.write(f"[bold white]  {model}[/] reasoning=[bold]{reasoning}[/]  [dim]{rid_short}[/]")
 
@@ -306,10 +310,12 @@ class LogView(Container):
                 log.write(f"  [yellow]{icon} {name}[/]")
 
         elif etype == "response.custom_tool_call_input.delta":
-            _safe_write(log, parsed.get("delta", ""))
+            delta = parsed.get("delta", "")
+            buf = self._stream_tool.get(rid, "")
+            self._stream_tool[rid] = buf + delta
 
         elif etype == "response.custom_tool_call_input.done":
-            log.write("")
+            pass  # handled by flush
 
         elif etype == "response.completed":
             self._flush_stream(log, final=True)
@@ -325,18 +331,24 @@ class LogView(Container):
             log.write(f"[dim]  ✓ {tok_str}[/]")
 
     def _flush_stream(self, log: RichLog, final: bool = False):
-        """Write accumulated streaming text to RichLog."""
-        if not self._stream_text:
-            return
+        """Write accumulated streaming text and tool input to RichLog."""
+        # Flush text streams
         for rid, text in list(self._stream_text.items()):
-            if not text:
-                continue
-            # Collapse JSON escapes to actual chars for display
-            display = text.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t").replace("\\\"", "\"")
-            # Escape Rich markup brackets in the accumulated text
-            display = display.replace("[", "\\[")
-            log.write(display, shrink=not final)
+            if text:
+                display = text.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t").replace("\\\"", "\"")
+                display = display.replace("[", "\\[")
+                log.write(display, shrink=not final)
             if final:
                 self._stream_text.pop(rid, None)
             else:
-                self._stream_text[rid] = ""  # reset but keep key for next cycle
+                self._stream_text[rid] = ""
+        # Flush tool input streams
+        for rid, text in list(self._stream_tool.items()):
+            if text:
+                display = text.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t").replace("\\\"", "\"")
+                display = display.replace("[", "\\[")
+                log.write(display, shrink=not final)
+            if final:
+                self._stream_tool.pop(rid, None)
+            else:
+                self._stream_tool[rid] = ""
