@@ -59,6 +59,8 @@ class LogView(Container):
     def on_mount(self):
         self._sse = SSESource()
         self._analyzer = ResponseAnalyzer()
+        self._active_session: SessionMeta | None = None
+        self._history_event_count: int = 0
 
         sse_log = self.query_one("#sse-log", RichLog)
         sse_log.write("[bold green]Reveal[/] — waiting for SSE events...")
@@ -69,11 +71,12 @@ class LogView(Container):
         hist_log.write("[bold green]Select a session from the sidebar[/] to view its history.")
 
         diag_log = self.query_one("#diag-log", RichLog)
-        diag_log.write("[bold green]Diagnostics[/] — analyzing response integrity...")
-        diag_log.write("[dim]Watching for: whitespace padding, token inflation, invisible chars, repeated content[/]")
+        diag_log.write("[bold green]Diagnostics[/] — response integrity + speed analysis")
+        diag_log.write("[dim]Detects: WS padding, token inflation, invisible chars, burst dumping, TPS anomalies[/]")
 
     def load_session(self, meta: SessionMeta):
         """Load a session's rollout history into the History tab."""
+        self._active_session = meta
         hist_log = self.query_one("#history-log", RichLog)
         hist_log.clear()
 
@@ -101,8 +104,9 @@ class LogView(Container):
                 pass  # skip world state
             # session_meta already handled
 
+        self._history_event_count = len(events)
         hist_log.write(f"\n[dim]{'─' * 40}[/]")
-        hist_log.write(f"[dim]End of session ({len(events)} events)[/]")
+        hist_log.write(f"[dim]End of session ({self._history_event_count} events)[/]")
 
     def poll_sse(self):
         """Poll for new SSE events and update all views."""
@@ -115,6 +119,34 @@ class LogView(Container):
 
         if events:
             self._refresh_diagnostics()
+
+        # ── Live history re-read ──────────────────────────────────────
+        self._poll_history()
+
+    def _poll_history(self):
+        """Re-read the active session's JSONL file and append new events."""
+        if self._active_session is None:
+            return
+        try:
+            events = read_rollout(self._active_session.file_path)
+        except OSError:
+            return
+
+        new_count = len(events)
+        if new_count <= self._history_event_count:
+            return
+
+        # Append only new events
+        hist_log = self.query_one("#history-log", RichLog)
+        for ev in events[self._history_event_count:]:
+            etype = ev.get("type", "")
+            payload = ev.get("payload", {})
+            if etype == "event_msg":
+                self._write_event_msg(hist_log, payload)
+            elif etype == "response_item":
+                self._write_response_item(hist_log, payload)
+
+        self._history_event_count = new_count
 
     def _refresh_diagnostics(self):
         """Update the Diagnostics tab with current analyzer state."""
@@ -144,21 +176,21 @@ class LogView(Container):
         if suspicious:
             diag_log.write("[bold underline]Recent Suspicious Responses:[/]")
             diag_log.write(
-                f"  {'Model':<12} {'Score':>5} {'WS%':>6} {'Tok×':>6} "
-                f"{'Chars':>7} {'Flags':<20}"
+                f"  {'Model':<12} {'Sc':>3} {'WS%':>5} {'Tok×':>5} "
+                f"{'TPS':>6} {'δ/s':>6} {'Flags'}"
             )
             for rs in reversed(suspicious):
                 score = rs.suspicion_score
                 sc_color = "red" if score >= 50 else ("yellow" if score >= 25 else "dim")
                 flags_str = " ".join(rs.flags[:4])
                 diag_log.write(
-                    f"  {rs.model:<12} [{sc_color}]{score:>3}[/]  "
-                    f"{rs.whitespace_ratio:>5.0%}  "
-                    f"{rs.token_inflation:>5.1f}  "
-                    f"{rs.total_chars:>6}  "
-                    f"[dim]{flags_str:<20}[/]"
+                    f"  {rs.model:<12} [{sc_color}]{score:>2}[/]  "
+                    f"{rs.whitespace_ratio:>4.0%}  "
+                    f"{rs.token_inflation:>4.1f}  "
+                    f"{rs.effective_tps:>5.0f}  "
+                    f"{rs.deltas_per_second:>5.0f}  "
+                    f"[dim]{flags_str}[/]"
                 )
-                # Show samples for high-score responses
                 if score >= 30 and rs.suspicious_samples:
                     for sample in rs.suspicious_samples[:2]:
                         diag_log.write(f"    [red]![/] [dim]{sample}[/]")
@@ -182,8 +214,10 @@ class LogView(Container):
         # ── Footer hint ──────────────────────────────────────────────
         diag_log.write("")
         diag_log.write(
-            "[dim]Legend: WS% = whitespace ratio  |  Tok× = reported/estimated tokens  "
-            "|  δ = deltas  |  WSδ = dirty deltas (>80% ws)[/]"
+            "[dim]Legend: WS%=whitespace  Tok×=token inflation  TPS=tokens/sec  δ/s=deltas/sec[/]"
+        )
+        diag_log.write(
+            "[dim]  FAST=high TPS  BURST=delta bursts  CHUNK=large avg delta  BIGδ=oversized delta[/]"
         )
 
     def _write_event_msg(self, log: RichLog, payload: dict):

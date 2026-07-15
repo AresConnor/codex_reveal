@@ -37,7 +37,7 @@ class SSESource:
         db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
         rows = db.execute(
-            "SELECT id, ts, level, feedback_log_body FROM logs "
+            "SELECT id, ts, ts_nanos, level, feedback_log_body FROM logs "
             "WHERE target = 'codex_api::sse::responses' AND id > ? "
             "ORDER BY id ASC",
             (self._last_id,)
@@ -56,9 +56,11 @@ class SSESource:
             except json.JSONDecodeError:
                 parsed = {}
 
+            ts_float = float(row["ts"]) + float(row["ts_nanos"]) / 1e9
+
             events.append(SSEEvent(
                 id=row["id"],
-                timestamp=row["ts"],
+                timestamp=ts_float,
                 level=row["level"],
                 event_type=parsed.get("type", "?"),
                 raw_body=body,

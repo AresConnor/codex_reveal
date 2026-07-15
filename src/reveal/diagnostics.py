@@ -51,7 +51,13 @@ class ResponseStats:
     large_deltas: int = 0                 # deltas >200 chars
     repeated_char_deltas: int = 0         # deltas with 20+ repeated chars
     invisible_char_deltas: int = 0        # deltas with invisible unicode
-
+    # Timing / speed metrics
+    created_at: float = 0.0              # Unix timestamp (seconds with nanos)
+    completed_at: float = 0.0
+    delta_timestamps: list[float] = field(default_factory=list)  # per-delta arrival times
+    burst_count: int = 0                 # groups of 3+ deltas within 50ms
+    max_delta_gap_ms: float = 0.0        # largest inter-delta gap
+    avg_delta_size: float = 0.0          # average chars per text delta
     # Samples of suspicious deltas (for inspection)
     suspicious_samples: list[str] = field(default_factory=list)
     max_delta_size: int = 0
@@ -69,6 +75,27 @@ class ResponseStats:
     def estimated_tokens(self) -> int:
         """Rough token estimate: ~4 chars per token."""
         return max(1, self.content_chars // 4)
+
+    @property
+    def elapsed_seconds(self) -> float:
+        """Wall-clock time from created to completed."""
+        if self.created_at and self.completed_at:
+            return self.completed_at - self.created_at
+        return 0.0
+
+    @property
+    def effective_tps(self) -> float:
+        """Tokens per second based on wall time."""
+        if self.elapsed_seconds > 0:
+            return self.reported_output_tokens / self.elapsed_seconds
+        return 0.0
+
+    @property
+    def deltas_per_second(self) -> float:
+        """Text deltas per second."""
+        if self.elapsed_seconds > 0 and self.text_delta_count > 0:
+            return self.text_delta_count / self.elapsed_seconds
+        return 0.0
 
     @property
     def token_inflation(self) -> float:
@@ -93,6 +120,15 @@ class ResponseStats:
             score += 15
         if self.large_deltas > 2:
             score += 10
+        # Timing/speed heuristics
+        if self.effective_tps > 150:
+            score += min(25, int(self.effective_tps / 10))
+        if self.deltas_per_second > 50:
+            score += min(15, int(self.deltas_per_second / 5))
+        if self.burst_count > 0:
+            score += min(15, self.burst_count * 5)
+        if self.text_delta_count > 0 and self.avg_delta_size > 100:
+            score += min(15, int(self.avg_delta_size / 20))
         return min(100, score)
 
     @property
@@ -113,6 +149,14 @@ class ResponseStats:
             f.append(f"REP:{self.repeated_char_deltas}")
         if self.large_deltas > 2:
             f.append(f"BIGδ:{self.large_deltas}")
+        if self.effective_tps > 150:
+            f.append(f"FAST:{self.effective_tps:.0f}tps")
+        if self.deltas_per_second > 50:
+            f.append(f"BURST:{self.deltas_per_second:.0f}δ/s")
+        if self.burst_count > 0:
+            f.append(f"BURSTS:{self.burst_count}")
+        if self.text_delta_count > 0 and self.avg_delta_size > 100:
+            f.append(f"CHUNK:{self.avg_delta_size:.0f}avg")
         return f
 
 
@@ -134,31 +178,33 @@ class ResponseAnalyzer:
         """Feed an SSE event. Returns the affected ResponseStats for UI updates."""
         etype = event.event_type
         parsed = event.parsed
+        ts = float(event.timestamp)  # seconds (integer) — sufficient for burst detection
 
         if etype == "response.created":
-            return self._on_created(parsed)
+            return self._on_created(parsed, ts)
 
         elif etype == "response.output_text.delta":
-            return self._on_delta(parsed, kind="text")
+            return self._on_delta(parsed, kind="text", ts=ts)
 
         elif etype == "response.custom_tool_call_input.delta":
-            return self._on_delta(parsed, kind="tool_input")
+            return self._on_delta(parsed, kind="tool_input", ts=ts)
 
         elif etype == "response.output_item.added":
             return self._on_item_added(parsed)
 
         elif etype == "response.completed":
-            return self._on_completed(parsed)
+            return self._on_completed(parsed, ts)
 
         return None
 
-    def _on_created(self, parsed: dict) -> ResponseStats:
+    def _on_created(self, parsed: dict, ts: float) -> ResponseStats:
         resp = parsed.get("response", {})
         rid = resp.get("id", "")
         rs = ResponseStats(
             response_id=rid,
             model=resp.get("model", "?"),
             reasoning_effort=resp.get("reasoning", {}).get("effort", "?"),
+            created_at=ts,
         )
         self.responses[rid] = rs
         return rs
@@ -169,9 +215,8 @@ class ResponseAnalyzer:
         rid = parsed.get("response_id", "")
         if rid and iid:
             self._item_response[iid] = rid
-        return self.responses.get(rid)
+    def _on_delta(self, parsed: dict, kind: str, ts: float = 0.0) -> ResponseStats | None:
 
-    def _on_delta(self, parsed: dict, kind: str) -> ResponseStats | None:
         delta = parsed.get("delta", "")
         iid = parsed.get("item_id", "")
         rid = parsed.get("response_id", "") or self._item_response.get(iid, "")
@@ -199,7 +244,15 @@ class ResponseAnalyzer:
         else:
             rs.tool_input_delta_count += 1
 
-        # Global counters (text deltas only — tool input is structural)
+        # ── Timing tracking (per-delta arrival) ───────────────────────
+        if ts > 0 and kind == "text":
+            rs.delta_timestamps.append(ts)
+            # Incremental avg delta size
+            if rs.text_delta_count > 0:
+                rs.avg_delta_size = (
+                    (rs.avg_delta_size * (rs.text_delta_count - 1) + n)
+                    / rs.text_delta_count
+                )
         if kind == "text":
             self.total_whitespace_chars += ws
             self.total_content_chars += content
@@ -227,28 +280,45 @@ class ResponseAnalyzer:
                 preview = raw[:80].replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
                 rs.suspicious_samples.append(f"δ={n} ws={ratio:.0%} [{preview}]")
 
-        return rs
-
-    def _on_completed(self, parsed: dict) -> ResponseStats | None:
+    def _on_completed(self, parsed: dict, ts: float) -> ResponseStats | None:
         resp = parsed.get("response", {})
         rid = resp.get("id", "")
         rs = self.responses.get(rid)
         if rs is None:
             return None
 
+        rs.completed_at = ts
+
         usage = resp.get("usage", {})
         details_out = usage.get("output_tokens_details") or {}
-        details_in = usage.get("input_tokens_details") or {}
 
         rs.reported_output_tokens = usage.get("output_tokens", 0)
         rs.reported_input_tokens = usage.get("input_tokens", 0)
         rs.reported_reasoning_tokens = details_out.get("reasoning_tokens", 0)
         rs.status = resp.get("status", "?")
 
+        # ── Burst detection ───────────────────────────────────────────
+        # A "burst" = 3+ text deltas within 50ms window
+        tss = rs.delta_timestamps
+        if len(tss) >= 3:
+            # Compute inter-delta gaps
+            gaps = [tss[i] - tss[i-1] for i in range(1, len(tss))]
+            if gaps:
+                rs.max_delta_gap_ms = max(gaps) * 1000
+            # Sliding window burst detection
+            burst_count = 0
+            window_start = 0
+            for i in range(len(tss)):
+                while tss[i] - tss[window_start] > 0.05:  # 50ms window
+                    window_start += 1
+                if i - window_start >= 2:  # at least 3 in window
+                    burst_count += 1
+                    window_start = i + 1  # reset window after burst
+            rs.burst_count = burst_count
+
         if rs.suspicion_score >= 15:
             self.total_suspicious += 1
 
-        # Move to completed
         self.completed.append(rs)
         del self.responses[rid]
         return rs

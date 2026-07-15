@@ -35,7 +35,7 @@ class SessionGroup:
 class SSEEvent:
     """A single SSE event from the logs database."""
     id: int
-    timestamp: int
+    timestamp: float  # seconds with nanosecond precision
     level: str
     event_type: str
     raw_body: str
