@@ -4,6 +4,8 @@ Codex log viewer TUI — browse rollout sessions and monitor Responses API SSE s
 
 ![Reveal screenshot](screenshot.png)
 
+**Version:** 1.0.0
+
 ## Requirements
 
 - Python **≥ 3.13**
@@ -16,8 +18,11 @@ Reveal opens the log DB **read-only**. It does not modify Codex state.
 
 ## Install & run
 
+### From a clone (development)
+
 ```powershell
-# from repo root
+git clone https://github.com/AresConnor/codex_reveal.git
+cd codex_reveal
 uv sync
 uv run reveal
 ```
@@ -26,6 +31,19 @@ Equivalent:
 
 ```powershell
 uv run python -m reveal
+```
+
+### Tool install (uv)
+
+```powershell
+uv tool install git+https://github.com/AresConnor/codex_reveal.git
+reveal
+```
+
+Upgrade later:
+
+```powershell
+uv tool upgrade reveal
 ```
 
 ## Layout

@@ -1,11 +1,21 @@
 [project]
 name = "reveal"
-version = "0.1.0"
+version = "1.0.0"
 description = "Codex Desktop log viewer — browse sessions and monitor SSE events in real time"
+readme = "README.md"
 requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "AresConnor" }]
+keywords = ["codex", "tui", "sse", "textual", "log-viewer"]
 dependencies = [
     "textual>=8.2.8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/AresConnor/codex_reveal"
+Repository = "https://github.com/AresConnor/codex_reveal"
+Issues = "https://github.com/AresConnor/codex_reveal/issues"
+Changelog = "https://github.com/AresConnor/codex_reveal/blob/main/CHANGELOG.md"
 
 [project.scripts]
 reveal = "reveal.__main__:main"
