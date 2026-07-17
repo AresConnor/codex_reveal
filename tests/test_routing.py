@@ -390,6 +390,56 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(thinking.done)
         self.assertEqual(len(router.unresolved), 0)
 
+    def test_unresolved_queue_capped_and_batch_retry_is_fast(self):
+        """Regression: huge unresolved must not freeze Live UI feed_many."""
+        import time
+
+        from reveal.routing import MAX_UNRESOLVED
+
+        router = ResponseRouter()
+        # Seed a normal response so family index is non-empty.
+        router.feed(
+            make_event(
+                1,
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_0af8c1b72a17fe43016a57c9deadbeef",
+                        "model": "sol",
+                    },
+                },
+            )
+        )
+        # Flood with unroutable orphans (no ids) — previously re-scanned every event.
+        orphans = [
+            make_event(
+                i + 2,
+                {
+                    "type": "response.output_text.delta",
+                    "delta": f"orphan-{i}",
+                },
+            )
+            for i in range(MAX_UNRESOLVED + 1500)
+        ]
+        t0 = time.perf_counter()
+        router.feed_many(orphans)
+        # Plus a healthy batch that should remain snappy even with a full queue.
+        more = [
+            make_event(
+                100_000 + i,
+                {
+                    "type": "response.output_text.delta",
+                    "delta": f"more-{i}",
+                },
+            )
+            for i in range(500)
+        ]
+        router.feed_many(more)
+        elapsed = time.perf_counter() - t0
+        self.assertLessEqual(len(router.unresolved), MAX_UNRESOLVED)
+        # Generous CI bound; the buggy O(n^2) path was multi-second to minutes.
+        self.assertLess(elapsed, 2.0, f"feed_many too slow with unresolved backlog: {elapsed:.3f}s")
+
 
 if __name__ == "__main__":
     unittest.main()

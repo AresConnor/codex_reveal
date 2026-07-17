@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timezone, timedelta
+import os
 import time
 
 from textual.app import ComposeResult
@@ -32,6 +33,30 @@ from .virtual_content import VirtualContentSource
 CST = timezone(timedelta(hours=8))
 
 
+def format_history_token_line(last_token_usage: dict) -> str:
+    """Format History token_count line with optional cache hit rate."""
+    last = last_token_usage or {}
+    in_tok = last.get("input_tokens", "?")
+    cached = last.get("cached_input_tokens", "?")
+    out_tok = last.get("output_tokens", "?")
+    parts = [
+        f"tokens: in={in_tok}",
+        f"cached={cached}",
+        f"out={out_tok}",
+    ]
+    try:
+        in_n = int(last.get("input_tokens"))
+        cached_n = int(last.get("cached_input_tokens") or 0)
+    except (TypeError, ValueError):
+        in_n = 0
+        cached_n = 0
+    if in_n > 0:
+        rate_pct = (cached_n / in_n) * 100.0
+        parts.append(f"cached_rate={rate_pct:.1f}%")
+    return "[dim]" + " ".join(parts) + "[/]"
+
+
+
 class LogView(Container):
     """Main log display with Live cards, History, and Diagnostics tabs."""
 
@@ -45,6 +70,7 @@ class LogView(Container):
         self._analyzer = ResponseAnalyzer()
         self._active_session: SessionMeta | None = None
         self._history_event_count = 0
+        self._history_file_sig: tuple[int, int] | None = None  # (mtime_ns, size)
         self._scope: Scope = None
         self._raw_mode = False  # retained for status; raw is per-item now
         self._card_limits = (100, 200, 500, 1000)
@@ -92,6 +118,7 @@ class LogView(Container):
 
     def load_session(self, meta: SessionMeta) -> None:
         self._active_session = meta
+        self._history_file_sig = None
         hist_log = self.query_one("#history-log", RichLog)
         hist_log.clear()
         name = meta.agent_nickname or "root"
@@ -105,8 +132,11 @@ class LogView(Container):
         hist_log.write("[dim]" + "=" * 50 + "[/]\n")
         try:
             events = read_rollout(meta.file_path)
+            st = os.stat(meta.file_path)
+            self._history_file_sig = (st.st_mtime_ns, st.st_size)
         except OSError:
             hist_log.write("[red]Failed to read session file.[/]")
+            self._history_event_count = 0
             return
         for ev in events:
             if ev.get("type") == "event_msg":
@@ -242,10 +272,20 @@ class LogView(Container):
     def _poll_history(self) -> None:
         if self._active_session is None:
             return
+        path = self._active_session.file_path
         try:
-            events = read_rollout(self._active_session.file_path)
+            st = os.stat(path)
+            sig = (st.st_mtime_ns, st.st_size)
         except OSError:
             return
+        # Cheap skip: unchanged rollout must not re-parse multi-MB JSONL on UI thread.
+        if self._history_file_sig == sig:
+            return
+        try:
+            events = read_rollout(path)
+        except OSError:
+            return
+        self._history_file_sig = sig
         if len(events) <= self._history_event_count:
             return
         hist_log = self.query_one("#history-log", RichLog)
@@ -260,8 +300,6 @@ class LogView(Container):
         try:
             diag_log = self.query_one("#diag-log", RichLog)
         except Exception:
-            return
-        if diag_log.size.width <= 1:
             return
         a = self._analyzer
         m = self._router.metrics()
@@ -308,11 +346,7 @@ class LogView(Container):
             log.write(f"[bold cyan]user:[/] {payload.get('message', '')[:200]}")
         elif ptype == "token_count":
             last = (payload.get("info") or {}).get("last_token_usage") or {}
-            log.write(
-                f"[dim]tokens: in={last.get('input_tokens','?')} "
-                f"cached={last.get('cached_input_tokens','?')} "
-                f"out={last.get('output_tokens','?')}[/]"
-            )
+            log.write(format_history_token_line(last))
         elif ptype == "task_complete":
             log.write(f"[dim]task completed in {payload.get('duration_ms', 0)}ms[/]")
 

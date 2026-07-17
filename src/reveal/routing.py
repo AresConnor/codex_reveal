@@ -32,6 +32,12 @@ _ID_KIND_RE = re.compile(r"^(?P<kind>[A-Za-z]+)_+(?P<rest>.+)$")
 _HEX_RUN_RE = re.compile(r"^[0-9a-fA-F]{16,}")
 _FAMILY_LEN = 24
 
+# Hard cap: events that never get a safe assignment must not grow without bound.
+# Long-running Live sessions previously froze the UI because feed() re-scanned
+# the entire unresolved list on every event (O(events × unresolved × responses)).
+MAX_UNRESOLVED = 5000
+
+
 
 def classify_item(protocol_type: str) -> ItemKind:
     t = (protocol_type or "").lower()
@@ -236,9 +242,12 @@ class ResponseRouter:
         changed: list[str] = []
         reassigned: list[tuple[str, str | None, str | None]] = []
         for event in events:
-            snap = self.feed(event)
+            # Defer unresolved drain to once-per-batch (not once-per-event).
+            snap = self.feed(event, retry_unresolved=False)
             changed.extend(snap.changed_response_ids)
             reassigned.extend(snap.reassigned)
+        drained = self._retry_unresolved()
+        changed.extend(drained)
         # de-dupe preserve order
         seen: set[str] = set()
         ordered_changed: list[str] = []
@@ -248,18 +257,15 @@ class ResponseRouter:
                 ordered_changed.append(rid)
         return RouterSnapshot(changed_response_ids=ordered_changed, reassigned=reassigned)
 
-    def feed(self, event: RawLogEvent) -> RouterSnapshot:
+    def feed(self, event: RawLogEvent, *, retry_unresolved: bool = True) -> RouterSnapshot:
         # Lifecycle/request evidence may carry thread ids without being SSE items.
         if event.thread_id and event.process_uuid:
             self.process_threads[event.process_uuid].add(event.thread_id)
 
         response_id = self._resolve_response_id(event)
         if response_id is None:
-            self.unresolved.append(
-                UnresolvedEvent(event=event, reason="no_safe_response_assignment")
-            )
-            # Still try to drain unresolved later
-            drained = self._retry_unresolved()
+            self._append_unresolved(event, reason="no_safe_response_assignment")
+            drained = self._retry_unresolved() if retry_unresolved else []
             return RouterSnapshot(changed_response_ids=drained)
 
         created = response_id not in self.responses
@@ -278,7 +284,7 @@ class ResponseRouter:
             if response_id not in bucket:
                 bucket.append(response_id)
 
-        drained = self._retry_unresolved()
+        drained = self._retry_unresolved() if retry_unresolved else []
         changed = [response_id] + drained
         # de-dupe
         out: list[str] = []
@@ -291,6 +297,7 @@ class ResponseRouter:
             # created already in out via response_id
             pass
         return RouterSnapshot(changed_response_ids=out, reassigned=reassigned)
+
 
     def attach_tool_result(self, call_id: str, result: ToolResult) -> str | None:
         rid = self.call_index.get(call_id)
@@ -340,6 +347,7 @@ class ResponseRouter:
 
         # Do NOT assign based solely on single active response.
         # Generation-family match routes item streams to their response when unique.
+        # O(1) via family_index only — never scan all responses (that froze Live UI).
         candidates: list[str] = []
         for token in (event.item_id, event.response_id):
             key = generation_key(token)
@@ -350,18 +358,8 @@ class ResponseRouter:
         if len(candidates) == 1:
             return candidates[0]
 
-        # Also accept unique family match across known response ids directly
-        if event.item_id:
-            key = generation_key(event.item_id)
-            if key:
-                matches = [
-                    rid for rid in self.responses if generation_key(rid) == key
-                ]
-                if len(matches) == 1:
-                    self.family_index[key] = matches[0]
-                    return matches[0]
-
         return None
+
 
     def _ensure_response(self, response_id: str, event: RawLogEvent) -> ResponseState:
         state = self.responses.get(response_id)
@@ -700,22 +698,35 @@ class ResponseRouter:
             state.attribution.source_log_ids.append(log_id)
         return True
 
+    def _append_unresolved(self, event: RawLogEvent, *, reason: str) -> None:
+        self.unresolved.append(UnresolvedEvent(event=event, reason=reason))
+        if len(self.unresolved) > MAX_UNRESOLVED:
+            # Drop oldest; keep the freshest window for late joins.
+            overflow = len(self.unresolved) - MAX_UNRESOLVED
+            del self.unresolved[:overflow]
+
     def _retry_unresolved(self) -> list[str]:
         if not self.unresolved:
             return []
         remaining: list[UnresolvedEvent] = []
         changed: list[str] = []
         for entry in self.unresolved:
-            rid = self._resolve_response_id(entry.event)
+            # Skip permanently unroutable rows (no id hooks) without re-scanning forever.
+            ev = entry.event
+            if not ev.response_id and not ev.item_id:
+                remaining.append(entry)
+                continue
+            rid = self._resolve_response_id(ev)
             if rid is None:
                 remaining.append(entry)
                 continue
-            state = self._ensure_response(rid, entry.event)
-            self._apply_event(state, entry.event)
-            self._maybe_attribute(state, entry.event)
+            state = self._ensure_response(rid, ev)
+            self._apply_event(state, ev)
+            self._maybe_attribute(state, ev)
             changed.append(rid)
         self.unresolved = remaining
         return changed
+
 
 
 def display_item_number(output_index: int) -> int:

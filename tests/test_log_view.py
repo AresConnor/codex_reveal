@@ -1,6 +1,7 @@
 import unittest
 
 from reveal.routing import display_item_number
+from reveal.widgets.log_view import format_history_token_line
 from reveal.widgets.virtual_content import VirtualContentSource, is_large_content
 
 
@@ -30,3 +31,35 @@ class VirtualContentTests(unittest.TestCase):
 
     def test_item_numbers(self):
         self.assertEqual(display_item_number(0), 1)
+
+
+class HistoryTokenLineTests(unittest.TestCase):
+    def test_cached_rate_percent(self):
+        line = format_history_token_line(
+            {
+                "input_tokens": 1000,
+                "cached_input_tokens": 250,
+                "output_tokens": 40,
+            }
+        )
+        self.assertIn("tokens: in=1000", line)
+        self.assertIn("cached=250", line)
+        self.assertIn("out=40", line)
+        self.assertIn("cached_rate=25.0%", line)
+
+    def test_omit_rate_when_input_zero(self):
+        line = format_history_token_line(
+            {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 1,
+            }
+        )
+        self.assertIn("tokens: in=0", line)
+        self.assertNotIn("cached_rate=", line)
+
+    def test_omit_rate_when_input_missing(self):
+        line = format_history_token_line({"output_tokens": 3})
+        self.assertIn("tokens: in=?", line)
+        self.assertNotIn("cached_rate=", line)
+
