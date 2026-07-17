@@ -8,3 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local git worktrees
+.worktrees/
+worktrees/
+
+# OMC operational state (skills under .omc/skills may be committed intentionally)
+.omc/state/
+.omc/notepad.md
+.omc/project-memory.json
+.omc/plans/
+.omc/research/
+.omc/logs/
+.omc/artifacts/
+.omc/handoffs/
+.omc/ultragoal/
