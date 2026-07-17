@@ -17,6 +17,9 @@ DEFAULT_TARGETS = (
     "codex_core::thread",
     "codex_core::client",
     "codex_api::endpoint::responses",
+    # Thread-bearing breadcrumbs used to attribute concurrent subagents.
+    "codex_core::session::turn",
+    "codex_core::stream_events_utils",
 )
 
 BACKFILL_COMPLETE_RESPONSES = 20

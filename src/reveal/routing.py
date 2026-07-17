@@ -37,6 +37,11 @@ _FAMILY_LEN = 24
 # the entire unresolved list on every event (O(events × unresolved × responses)).
 MAX_UNRESOLVED = 5000
 
+# Concurrent subagents share process_uuid; attribute SSE only when a single
+# thread was recently active for that process (avoids false assignment).
+PROCESS_THREAD_WINDOW_S = 45.0
+
+
 
 
 def classify_item(protocol_type: str) -> ItemKind:
@@ -207,8 +212,13 @@ class ResponseRouter:
     call_index: dict[str, str] = field(default_factory=dict)
     # thread-bound request evidence: process_uuid -> thread_id candidates
     process_threads: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    # process_uuid -> {thread_id: last_seen_ts} for concurrent multi-agent attribution
+    process_recent_threads: dict[str, dict[str, float]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
     _order_counter: int = 0
     _synthetic_seq: int = 0
+
 
     def metrics(self) -> RoutingMetrics:
         confirmed = inferred = unassigned = partial = conflicts = 0
@@ -260,16 +270,24 @@ class ResponseRouter:
     def feed(self, event: RawLogEvent, *, retry_unresolved: bool = True) -> RouterSnapshot:
         # Lifecycle/request evidence may carry thread ids without being SSE items.
         if event.thread_id and event.process_uuid:
-            self.process_threads[event.process_uuid].add(event.thread_id)
+            self._note_process_thread(
+                event.process_uuid, event.thread_id, event.timestamp or 0.0
+            )
 
         response_id = self._resolve_response_id(event)
         if response_id is None:
+            # Thread breadcrumbs must not flood the unresolved queue.
+            if self._is_attribution_breadcrumb(event):
+                reassigned = self._retry_process_attribution(event.process_uuid)
+                return RouterSnapshot(changed_response_ids=[], reassigned=reassigned)
             self._append_unresolved(event, reason="no_safe_response_assignment")
             drained = self._retry_unresolved() if retry_unresolved else []
             return RouterSnapshot(changed_response_ids=drained)
 
         created = response_id not in self.responses
         state = self._ensure_response(response_id, event)
+        if event.process_uuid and not state.process_uuid:
+            state.process_uuid = event.process_uuid
         old_thread = state.agent_thread_id
 
         self._apply_event(state, event)
@@ -297,6 +315,7 @@ class ResponseRouter:
             # created already in out via response_id
             pass
         return RouterSnapshot(changed_response_ids=out, reassigned=reassigned)
+
 
 
     def attach_tool_result(self, call_id: str, result: ToolResult) -> str | None:
@@ -619,6 +638,74 @@ class ResponseRouter:
             return "\n".join(parts)
         return ""
 
+    def _note_process_thread(self, process_uuid: str, thread_id: str, ts: float) -> None:
+        self.process_threads[process_uuid].add(thread_id)
+        bucket = self.process_recent_threads[process_uuid]
+        bucket[thread_id] = ts
+        cutoff = ts - PROCESS_THREAD_WINDOW_S
+        stale = [tid for tid, seen in bucket.items() if seen < cutoff]
+        for tid in stale:
+            del bucket[tid]
+
+    def _unique_recent_thread(self, process_uuid: str | None, ts: float) -> str | None:
+        if not process_uuid:
+            return None
+        bucket = self.process_recent_threads.get(process_uuid) or {}
+        if not bucket:
+            # Fall back to set-based unique process→thread (single agent process).
+            threads = self.process_threads.get(process_uuid) or set()
+            if len(threads) == 1:
+                return next(iter(threads))
+            return None
+        cutoff = ts - PROCESS_THREAD_WINDOW_S
+        active = [tid for tid, seen in bucket.items() if seen >= cutoff]
+        if len(active) == 1:
+            return active[0]
+        return None
+
+    @staticmethod
+    def _is_attribution_breadcrumb(event: RawLogEvent) -> bool:
+        if event.response_id or event.item_id:
+            return False
+        body = event.raw_body or ""
+        if body.startswith("SSE event:") or body.startswith("unhandled responses event:"):
+            return False
+        return bool(event.thread_id or event.process_uuid)
+
+    def _retry_process_attribution(
+        self, process_uuid: str | None
+    ) -> list[tuple[str, str | None, str | None]]:
+        """When a thread breadcrumb arrives, try to assign unassigned responses."""
+        if not process_uuid:
+            return []
+        reassigned: list[tuple[str, str | None, str | None]] = []
+        for state in self.responses.values():
+            if state.process_uuid != process_uuid:
+                continue
+            if state.attribution.confidence != AttributionConfidence.UNASSIGNED:
+                continue
+            old = state.agent_thread_id
+            self._maybe_attribute(
+                state,
+                RawLogEvent(
+                    log_id=0,
+                    timestamp=state.started_at or 0.0,
+                    target="codex_core::session::turn",
+                    process_uuid=process_uuid,
+                    thread_id=None,
+                    event_type="attribution_retry",
+                    sequence_number=None,
+                    response_id=state.response_id,
+                    item_id=None,
+                    output_index=None,
+                    raw_body="",
+                    parsed={},
+                ),
+            )
+            if state.agent_thread_id != old:
+                reassigned.append((state.response_id, old, state.agent_thread_id))
+        return reassigned
+
     def _maybe_attribute(self, state: ResponseState, event: RawLogEvent) -> None:
         if state.attribution.confidence == AttributionConfidence.CONFIRMED:
             # Record conflicts only; never downgrade or move.
@@ -628,9 +715,36 @@ class ResponseRouter:
                     state.attribution.conflicts.append(msg)
             return
 
-        # Level 2-ish: unique process->thread mapping with request path
-        if event.process_uuid:
-            threads = self.process_threads.get(event.process_uuid) or set()
+        if event.process_uuid and not state.process_uuid:
+            state.process_uuid = event.process_uuid
+
+        # Direct thread on the event itself (non-SSE lifecycle rows).
+        if event.thread_id:
+            conf = (
+                AttributionConfidence.CONFIRMED
+                if event.target != "codex_api::sse::responses"
+                else AttributionConfidence.INFERRED
+            )
+            kind = (
+                EvidenceKind.REQUEST_LIFECYCLE
+                if conf == AttributionConfidence.CONFIRMED
+                else EvidenceKind.STREAM_CORRELATION
+            )
+            self._upgrade_attribution(
+                state,
+                thread_id=event.thread_id,
+                confidence=conf,
+                evidence_kind=kind,
+                log_id=event.log_id,
+                detail="event.thread_id",
+            )
+            return
+
+        # Unique process→thread (single-agent process) OR unique recent thread
+        # under multi-agent concurrency.
+        if event.process_uuid or state.process_uuid:
+            pu = event.process_uuid or state.process_uuid
+            threads = self.process_threads.get(pu or "") or set()
             if len(threads) == 1:
                 thread_id = next(iter(threads))
                 conf = (
@@ -653,8 +767,19 @@ class ResponseRouter:
                 )
                 return
 
-        # Level 4: opaque id prefix alone never confirms; only infer when unique
-        # and we already have a candidate thread elsewhere — otherwise leave unassigned.
+            ts = event.timestamp or state.started_at or 0.0
+            recent = self._unique_recent_thread(pu, ts)
+            if recent:
+                self._upgrade_attribution(
+                    state,
+                    thread_id=recent,
+                    confidence=AttributionConfidence.INFERRED,
+                    evidence_kind=EvidenceKind.STREAM_CORRELATION,
+                    log_id=event.log_id,
+                    detail="unique recent process thread",
+                )
+                return
+
         return
 
     def _upgrade_attribution(

@@ -126,6 +126,52 @@ class WidgetPilotTests(unittest.IsolatedAsyncioTestCase):
             feed.upsert_response(router.get("resp_aaa111"))
             self.assertEqual(len(list(feed.query(ResponseCard))), 1)
 
+    async def test_scope_remount_reuses_single_card(self):
+        """Regression: filter remount must not DuplicateIds / multi-mount same response."""
+        from reveal.models import AgentScope, AttributionConfidence, AttributionEvidence
+
+        router = ResponseRouter()
+        events = fixture_single_response_thinking_tool_answer()
+        router.feed_many(events)
+        state = router.get("resp_aaa111")
+        assert state is not None
+        # Simulate attributed agent so agent-scope can match.
+        state.agent_thread_id = "thread-a"
+        state.attribution = AttributionEvidence(
+            thread_id="thread-a",
+            confidence=AttributionConfidence.INFERRED,
+        )
+
+        app = FeedApp()
+        async with app.run_test() as pilot:
+            feed = app.query_one(ResponseFeed)
+            feed.upsert_response(state)
+            await pilot.pause()
+            self.assertEqual(len(list(feed.query(ResponseCard))), 1)
+
+            # Toggle scopes repeatedly (same path as tree clicks).
+            feed.set_scope(AgentScope(thread_id="thread-a"), {"thread-a"})
+            await pilot.pause()
+            self.assertEqual(len(list(feed.query(ResponseCard))), 1)
+
+            feed.set_scope(None, None)
+            await pilot.pause()
+            self.assertEqual(len(list(feed.query(ResponseCard))), 1)
+
+            feed.set_scope(AgentScope(thread_id="thread-b"), {"thread-b"})
+            await pilot.pause()
+            self.assertEqual(len(list(feed.query(ResponseCard))), 0)
+
+            feed.set_scope(AgentScope(thread_id="thread-a"), {"thread-a"})
+            await pilot.pause()
+            self.assertEqual(len(list(feed.query(ResponseCard))), 1)
+            # Same rid still only one DOM card after many remounts.
+            feed.upsert_response(state)
+            feed.upsert_response(state)
+            await pilot.pause()
+            self.assertEqual(len(list(feed.query(ResponseCard))), 1)
+
+
     async def test_thinking_text_appends_until_done_and_raw_is_selectable(self):
         router = ResponseRouter()
         events = fixture_single_response_thinking_tool_answer()

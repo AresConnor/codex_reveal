@@ -97,6 +97,11 @@ class LogView(Container):
         self.catalog = catalog
 
     def apply_scope(self, scope: Scope) -> None:
+        """Filter Live feed + load History for agent nodes.
+
+        Live: workspace/session/none = total; agent = that thread; Unassigned = unassigned.
+        History: only when an agent node is selected.
+        """
         self._scope = scope
         feed = self.query_one("#response-feed", ResponseFeed)
         threads = self.catalog.thread_ids_for_scope(scope)
@@ -114,7 +119,7 @@ class LogView(Container):
         elif isinstance(scope, (WorkspaceScope, SessionScope, UnassignedScope)):
             hist = self.query_one("#history-log", RichLog)
             hist.clear()
-            hist.write("[bold]Select an agent[/] to load History (workspace/session scopes filter Live only).")
+            hist.write("[bold]Select an agent[/] to load History (Live: workspace/session = all, agent/Unassigned = filter).")
 
     def load_session(self, meta: SessionMeta) -> None:
         self._active_session = meta

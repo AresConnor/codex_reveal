@@ -72,13 +72,23 @@ class ResponseFeed(Vertical):
         self._agent_labels[thread_id] = label
 
     def set_scope(self, scope: Scope, thread_ids: set[str] | None) -> None:
+        """Configure Live filter.
+
+        - None / Workspace / Session → total feed (all cards + unassigned)
+        - AgentScope → only that agent thread
+        - UnassignedScope → only unassigned / no-thread cards
+        """
         self._scope = scope
         if isinstance(scope, UnassignedScope):
             self._scope_unassigned_only = True
             self._scope_threads = set()
-        else:
+        elif isinstance(scope, AgentScope):
             self._scope_unassigned_only = False
-            self._scope_threads = thread_ids
+            self._scope_threads = set(thread_ids or ())
+        else:
+            # Workspace/Session/None: aggregate Live view
+            self._scope_unassigned_only = False
+            self._scope_threads = None
         self._remount_filter()
 
     def upsert_response(self, state: ResponseState) -> None:
@@ -92,11 +102,7 @@ class ResponseFeed(Vertical):
         self._trim()
 
         if not self._visible(state):
-            # Keep view state; unmount if present
-            card = self._cards.pop(rid, None)
-            if card is not None:
-                self._capture_view_state(card)
-                card.remove()
+            self._hide_card(rid)
             if not self.follow_bottom:
                 if is_new:
                     self._paused_new += 1
@@ -114,11 +120,19 @@ class ResponseFeed(Vertical):
         card = self._cards.get(rid)
         label = self._label_for(state)
         if card is None:
-            card = ResponseCard(state, agent_label=label, id=f"card-{rid}")
+            card = ResponseCard(state, agent_label=label)
             self._cards[rid] = card
-            # Mount in order
             self._mount_card_ordered(scroll, card, rid)
             self._restore_view_state(card)
+        elif card.parent is not scroll:
+            # Re-attach the same widget instance after filter hide/show.
+            if card.is_mounted:
+                try:
+                    card.remove()
+                except Exception:
+                    pass
+            self._mount_card_ordered(scroll, card, rid)
+            card.refresh_from_state(state, agent_label=label)
         else:
             card.refresh_from_state(state, agent_label=label)
 
@@ -139,13 +153,24 @@ class ResponseFeed(Vertical):
         """Attribution changed; update filter membership without losing view state."""
         self.upsert_response(state)
 
+    def _hide_card(self, rid: str) -> None:
+        """Remove card from feed dict and DOM if present."""
+        card = self._cards.pop(rid, None)
+        if card is not None:
+            self._capture_view_state(card)
+            if card.is_mounted:
+                try:
+                    card.remove()
+                except Exception:
+                    pass
+
     def _mount_card_ordered(self, scroll: VerticalScroll, card: ResponseCard, rid: str) -> None:
         # Find previous visible card to mount after
         idx = self._order.index(rid)
         prev_widget = None
         for prev_id in reversed(self._order[:idx]):
             prev = self._cards.get(prev_id)
-            if prev is not None and prev.parent is scroll:
+            if prev is not None and prev.is_mounted and prev.parent is scroll:
                 prev_widget = prev
                 break
         if prev_widget is None:
@@ -153,13 +178,18 @@ class ResponseFeed(Vertical):
         else:
             scroll.mount(card, after=prev_widget)
 
+
     def _visible(self, state: ResponseState) -> bool:
         if self._scope_unassigned_only:
-            return state.attribution.confidence == AttributionConfidence.UNASSIGNED or not state.agent_thread_id
+            return (
+                state.attribution.confidence == AttributionConfidence.UNASSIGNED
+                or not state.agent_thread_id
+            )
         if self._scope_threads is None:
+            # Total Live view: every card, including unassigned.
             return True
         if not state.agent_thread_id:
-            # unassigned responses visible only when viewing all or unassigned
+            # Agent-scoped filter excludes unassigned.
             return False
         return state.agent_thread_id in self._scope_threads
 
@@ -199,26 +229,45 @@ class ResponseFeed(Vertical):
             self._order.remove(removable)
             self._states.pop(removable, None)
             self._view_state.pop(removable, None)
-            card = self._cards.pop(removable, None)
-            if card is not None:
-                card.remove()
+            self._hide_card(removable)
 
     def _remount_filter(self) -> None:
-        scroll = self.query_one("#feed-scroll", VerticalScroll)
-        # Capture state
-        for rid, card in list(self._cards.items()):
-            self._capture_view_state(card)
-            card.remove()
-        self._cards.clear()
-        for rid in self._order:
+        """Show/hide existing cards for the current scope — never mass-recreate IDs."""
+        if not self.is_mounted:
+            return
+        try:
+            scroll = self.query_one("#feed-scroll", VerticalScroll)
+        except Exception:
+            return
+
+        for rid in list(self._order):
             st = self._states.get(rid)
-            if st and self._visible(st):
-                card = ResponseCard(st, agent_label=self._label_for(st), id=f"card-{rid}")
-                self._cards[rid] = card
-                scroll.mount(card)
-                self._restore_view_state(card)
+            want = st is not None and self._visible(st)
+            card = self._cards.get(rid)
+
+            if want:
+                label = self._label_for(st)
+                if card is None:
+                    card = ResponseCard(st, agent_label=label)
+                    self._cards[rid] = card
+                    self._mount_card_ordered(scroll, card, rid)
+                    self._restore_view_state(card)
+                elif card.parent is not scroll:
+                    if card.is_mounted:
+                        try:
+                            card.remove()
+                        except Exception:
+                            pass
+                    self._mount_card_ordered(scroll, card, rid)
+                    card.refresh_from_state(st, agent_label=label)
+                else:
+                    card.refresh_from_state(st, agent_label=label)
+            elif card is not None:
+                self._hide_card(rid)
+
         if self.follow_bottom:
             scroll.scroll_end(animate=False)
+
 
     def _is_at_bottom(self, scroll: VerticalScroll) -> bool:
         try:

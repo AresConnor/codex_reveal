@@ -16,3 +16,7 @@ worktrees/
 # Agent/runtime state (local only)
 .omc/
 .omx/
+
+# Local crash / terminal dumps
+log.txt
+*.log

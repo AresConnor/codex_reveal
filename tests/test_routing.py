@@ -90,6 +90,94 @@ class RouterTests(unittest.TestCase):
             texts = [i.assembled_text for i in state.item_list]
             self.assertTrue(all("orphan" not in t for t in texts))
 
+    def test_unique_recent_process_thread_attributes_sse(self):
+        """SSE lacks thread_id; unique recent process→thread breadcrumb should infer."""
+        from reveal.models import AttributionConfidence
+
+        router = ResponseRouter()
+        pu = "pid:1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        tid = "019f705c-8524-7113-b27a-abcc104edd09"
+        family = "0af8c1b72a17fe43016a57c9"
+        rid = f"resp_{family}cb880c8190baad9b0be2799cc1"
+
+        # Thread breadcrumb (non-SSE) for the process.
+        router.feed(
+            make_event(
+                1,
+                "session turn started",
+                ts=100.0,
+                target="codex_core::session::turn",
+                process_uuid=pu,
+                thread_id=tid,
+            )
+        )
+        self.assertEqual(len(router.unresolved), 0)
+
+        router.feed(
+            make_event(
+                2,
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": {"id": rid, "model": "sol"},
+                },
+                ts=100.5,
+                process_uuid=pu,
+            )
+        )
+        state = router.get(rid)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state.agent_thread_id, tid)
+        self.assertEqual(state.attribution.confidence, AttributionConfidence.INFERRED)
+
+    def test_concurrent_process_threads_leave_sse_unassigned(self):
+        """Two active threads on same process must not steal attribution."""
+        from reveal.models import AttributionConfidence
+
+        router = ResponseRouter()
+        pu = "pid:1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        family = "0af8c1b72a17fe43016a57c9"
+        rid = f"resp_{family}cb880c8190baad9b0be2799cc1"
+
+        router.feed(
+            make_event(
+                1,
+                "turn a",
+                ts=100.0,
+                target="codex_core::session::turn",
+                process_uuid=pu,
+                thread_id="thread-a",
+            )
+        )
+        router.feed(
+            make_event(
+                2,
+                "turn b",
+                ts=100.1,
+                target="codex_core::session::turn",
+                process_uuid=pu,
+                thread_id="thread-b",
+            )
+        )
+        router.feed(
+            make_event(
+                3,
+                {
+                    "type": "response.created",
+                    "response": {"id": rid, "model": "sol"},
+                },
+                ts=100.2,
+                process_uuid=pu,
+            )
+        )
+        state = router.get(rid)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertIsNone(state.agent_thread_id)
+        self.assertEqual(state.attribution.confidence, AttributionConfidence.UNASSIGNED)
+
+
     def test_malformed_and_unhandled_retained(self):
         router = ResponseRouter()
         router.feed_many(fixture_malformed_and_unhandled())

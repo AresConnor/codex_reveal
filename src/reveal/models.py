@@ -212,6 +212,7 @@ class ResponseItemState:
 class ResponseState:
     response_id: str
     agent_thread_id: str | None = None
+    process_uuid: str | None = None
     attribution: AttributionEvidence = field(default_factory=AttributionEvidence)
     status: ResponseStatus = ResponseStatus.ACTIVE
     model: str = "?"
