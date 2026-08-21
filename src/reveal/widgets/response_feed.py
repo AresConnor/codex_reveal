@@ -217,7 +217,6 @@ class ResponseFeed(Vertical):
     def _trim(self) -> None:
         limit = self.card_limit
         while len(self._order) > limit:
-            # Never evict active
             removable = None
             for rid in self._order:
                 st = self._states.get(rid)
@@ -225,7 +224,7 @@ class ResponseFeed(Vertical):
                     removable = rid
                     break
             if removable is None:
-                break
+                removable = self._order[0]
             self._order.remove(removable)
             self._states.pop(removable, None)
             self._view_state.pop(removable, None)

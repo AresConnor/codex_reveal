@@ -20,3 +20,6 @@ worktrees/
 # Local crash / terminal dumps
 log.txt
 *.log
+
+# Local audit notes (not tracked)
+docs/security-audit-crash.md

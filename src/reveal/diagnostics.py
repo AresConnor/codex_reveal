@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 from .models import SSEEvent
+from .safe import as_dict, as_finite_float, as_finite_int, as_str
 
 # ── Patterns ────────────────────────────────────────────────────────────────
 
@@ -22,6 +23,8 @@ TOKEN_INFLATION_RATIO = 5.0  # reported/estimated > 5x → suspicious
 
 # Suspicious: delta much larger than typical streaming chunk
 LARGE_DELTA_THRESHOLD = 200  # chars — normal deltas are 1-20 chars
+MAX_COMPLETED = 200
+MAX_DELTA_TS = 2000
 
 
 @dataclass
@@ -188,8 +191,8 @@ class ResponseAnalyzer:
     def feed(self, event: SSEEvent) -> ResponseStats | None:
         """Feed an SSE event. Returns the affected ResponseStats for UI updates."""
         etype = event.event_type
-        parsed = event.parsed
-        ts = float(event.timestamp)  # seconds (integer) — sufficient for burst detection
+        parsed = as_dict(event.parsed)
+        ts = as_finite_float(event.timestamp)
 
         if etype == "response.created":
             return self._on_created(parsed, ts)
@@ -209,33 +212,36 @@ class ResponseAnalyzer:
         return None
 
     def _on_created(self, parsed: dict, ts: float) -> ResponseStats:
-        resp = parsed.get("response", {})
-        rid = resp.get("id", "")
+        resp = as_dict(parsed.get("response"))
+        rid = as_str(resp.get("id"))
+        reasoning = as_dict(resp.get("reasoning"))
+        effort = reasoning.get("effort")
         rs = ResponseStats(
             response_id=rid,
-            model=resp.get("model", "?"),
-            reasoning_effort=resp.get("reasoning", {}).get("effort", "?"),
+            model=as_str(resp.get("model"), "?") or "?",
+            reasoning_effort=str(effort) if effort is not None else "?",
             created_at=ts,
         )
         self.responses[rid] = rs
         return rs
 
     def _on_item_added(self, parsed: dict) -> ResponseStats | None:
-        item = parsed.get("item", {})
-        iid = item.get("id", "")
-        rid = parsed.get("response_id", "")
+        item = as_dict(parsed.get("item"))
+        iid = as_str(item.get("id"))
+        rid = as_str(parsed.get("response_id"))
         if rid and iid:
             self._item_response[iid] = rid
+        return None
     def _on_delta(self, parsed: dict, kind: str, ts: float = 0.0) -> ResponseStats | None:
-
         delta = parsed.get("delta", "")
-        iid = parsed.get("item_id", "")
-        rid = parsed.get("response_id", "") or self._item_response.get(iid, "")
+        if not isinstance(delta, str):
+            return None
+        iid = as_str(parsed.get("item_id"))
+        rid = as_str(parsed.get("response_id")) or self._item_response.get(iid, "")
         rs = self.responses.get(rid)
         if rs is None:
             return None
 
-        # Unescape JSON sequences for accurate measurement
         raw = delta.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t").replace("\\\"", "\"")
 
         n = len(raw)
@@ -256,10 +262,10 @@ class ResponseAnalyzer:
             rs.tool_input_delta_count += 1
             rs.tool_ws_chars += ws
             rs.tool_content_chars += content
-        # ── Timing tracking (per-delta arrival) ───────────────────────
         if ts > 0 and kind == "text":
             rs.delta_timestamps.append(ts)
-            # Incremental avg delta size
+            if len(rs.delta_timestamps) > MAX_DELTA_TS:
+                del rs.delta_timestamps[:-MAX_DELTA_TS]
             if rs.text_delta_count > 0:
                 rs.avg_delta_size = (
                     (rs.avg_delta_size * (rs.text_delta_count - 1) + n)
@@ -269,7 +275,7 @@ class ResponseAnalyzer:
             self.total_whitespace_chars += ws
             self.total_content_chars += content
 
-        # Anomaly detection (text deltas only — tool input whitespace is structural)
+        ratio = 0.0
         if kind == "text":
             ratio = ws / n if n > 0 else 0
             if ratio >= WHITESPACE_DELTA_THRESHOLD:
@@ -286,52 +292,50 @@ class ResponseAnalyzer:
             if inv > 0:
                 rs.invisible_char_deltas += 1
 
-        # Keep samples of suspicious deltas (up to 3)
         if ratio >= WHITESPACE_DELTA_THRESHOLD or rpt or inv > 0:
             if len(rs.suspicious_samples) < 3:
                 preview = raw[:80].replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
                 rs.suspicious_samples.append(f"δ={n} ws={ratio:.0%} [{preview}]")
+        return rs
 
     def _on_completed(self, parsed: dict, ts: float) -> ResponseStats | None:
-        resp = parsed.get("response", {})
-        rid = resp.get("id", "")
+        resp = as_dict(parsed.get("response"))
+        rid = as_str(resp.get("id"))
         rs = self.responses.get(rid)
         if rs is None:
             return None
 
         rs.completed_at = ts
 
-        usage = resp.get("usage", {})
-        details_out = usage.get("output_tokens_details") or {}
+        usage = as_dict(resp.get("usage"))
+        details_out = as_dict(usage.get("output_tokens_details"))
 
-        rs.reported_output_tokens = usage.get("output_tokens", 0)
-        rs.reported_input_tokens = usage.get("input_tokens", 0)
-        rs.reported_reasoning_tokens = details_out.get("reasoning_tokens", 0)
-        rs.status = resp.get("status", "?")
+        rs.reported_output_tokens = as_finite_int(usage.get("output_tokens"), 0) or 0
+        rs.reported_input_tokens = as_finite_int(usage.get("input_tokens"), 0) or 0
+        rs.reported_reasoning_tokens = as_finite_int(details_out.get("reasoning_tokens"), 0) or 0
+        rs.status = as_str(resp.get("status"), "?") or "?"
 
-        # ── Burst detection ───────────────────────────────────────────
-        # A "burst" = 3+ text deltas within 50ms window
         tss = rs.delta_timestamps
         if len(tss) >= 3:
-            # Compute inter-delta gaps
-            gaps = [tss[i] - tss[i-1] for i in range(1, len(tss))]
+            gaps = [tss[i] - tss[i - 1] for i in range(1, len(tss))]
             if gaps:
                 rs.max_delta_gap_ms = max(gaps) * 1000
-            # Sliding window burst detection
             burst_count = 0
             window_start = 0
             for i in range(len(tss)):
-                while tss[i] - tss[window_start] > 0.05:  # 50ms window
+                while tss[i] - tss[window_start] > 0.05:
                     window_start += 1
-                if i - window_start >= 2:  # at least 3 in window
+                if i - window_start >= 2:
                     burst_count += 1
-                    window_start = i + 1  # reset window after burst
+                    window_start = i + 1
             rs.burst_count = burst_count
 
         if rs.suspicion_score >= 15:
             self.total_suspicious += 1
 
         self.completed.append(rs)
+        if len(self.completed) > MAX_COMPLETED:
+            del self.completed[:-MAX_COMPLETED]
         del self.responses[rid]
         return rs
 

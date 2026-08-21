@@ -129,7 +129,7 @@ Switch **Text / Raw** on a thinking item to inspect verbatim SSE.
 | Follow | Pins to bottom when already at bottom; scroll away pauses; `End` resumes |
 | Pause indicator | Shows new/update counts while not following |
 | Startup | Bounded backfill (~20 recent completed + in-flight; ≤ 50k rows) then high-water live poll |
-| Retention | Card limits `100 / 200 / 500 / 1000` via `[` / `]`; active cards are never evicted |
+| Retention | Card limits `100 / 200 / 500 / 1000` via `[` / `]`; overflow evicts oldest cards, including hung active ones |
 
 ## Keys
 

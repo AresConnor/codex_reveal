@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from ..models import RawLogEvent, SSEEvent
 from ..routing import parse_log_body
+from ..safe import as_finite_float, as_finite_int, as_str, as_text
 
 DEFAULT_DB = os.path.expandvars(r"%USERPROFILE%\.codex\logs_2.sqlite")
 
@@ -141,7 +142,7 @@ class LogStream:
             return
         try:
             row = db.execute("SELECT MAX(id) AS m FROM logs").fetchone()
-            self._last_id = int(row["m"] or 0) if row else 0
+            self._last_id = (as_finite_int(row["m"]) or 0) if row else 0
             self.stats.high_water_id = self._last_id
             self.stats.cursor_id = self._last_id
             self.stats.events_seen = 0
@@ -159,7 +160,7 @@ class LogStream:
 
         try:
             row = db.execute("SELECT MAX(id) AS m FROM logs").fetchone()
-            high_water = int(row["m"] or 0) if row else 0
+            high_water = (as_finite_int(row["m"]) or 0) if row else 0
             self.stats.high_water_id = high_water
             if high_water <= 0:
                 self._last_id = 0
@@ -167,7 +168,7 @@ class LogStream:
 
             targets = list(self.targets)
             placeholders = ",".join("?" for _ in targets)
-            complete_starts: list[int] = []
+            complete_starts: set[int] = set()
             inflight_starts: set[int] = set()
             scanned = 0
             page = min(self.batch_size * 4, 2000)
@@ -190,7 +191,7 @@ class LogStream:
 
                 for r in rows:
                     scanned += 1
-                    body = r["feedback_log_body"] or ""
+                    body = as_text(r["feedback_log_body"])
                     rid = None
                     etype = ""
                     if body.startswith("SSE event:"):
@@ -223,24 +224,24 @@ class LogStream:
                     if etype == "response.created" and rid:
                         seen_response_starts[rid] = r["id"]
                         if rid in completed_responses:
-                            complete_starts.append(r["id"])
+                            complete_starts.add(r["id"])
                         else:
                             inflight_starts.add(r["id"])
                     elif etype in ("response.completed", "response.failed", "response.incomplete") and rid:
                         completed_responses.add(rid)
                         if rid in seen_response_starts:
-                            complete_starts.append(seen_response_starts[rid])
+                            complete_starts.add(seen_response_starts[rid])
                             inflight_starts.discard(seen_response_starts[rid])
 
-                    if len(set(complete_starts)) >= self.backfill_complete:
+                    if len(complete_starts) >= self.backfill_complete:
                         break
 
                 cursor = lower
-                if len(set(complete_starts)) >= self.backfill_complete:
+                if len(complete_starts) >= self.backfill_complete:
                     break
 
             self.stats.backfill_rows_scanned = scanned
-            start_ids = set(complete_starts) | set(inflight_starts)
+            start_ids = complete_starts | inflight_starts
             if not start_ids:
                 min_id = max(1, high_water - min(2000, self.row_budget))
             else:
@@ -254,7 +255,12 @@ class LogStream:
                 (min_id, high_water, *targets),
             ).fetchall()
 
-            events = [self._row_to_event(r) for r in rows]
+            events = []
+            for r in rows:
+                try:
+                    events.append(self._row_to_event(r))
+                except Exception:
+                    continue
             self._last_id = high_water
             self.stats.cursor_id = high_water
             self.stats.events_seen += len(events)
@@ -293,8 +299,14 @@ class LogStream:
 
         events: list[RawLogEvent] = []
         for r in rows:
-            self._last_id = int(r["id"])
-            events.append(self._row_to_event(r))
+            row_id = as_finite_int(r["id"])
+            if row_id is None:
+                continue
+            self._last_id = row_id
+            try:
+                events.append(self._row_to_event(r))
+            except Exception:
+                continue
         self.stats.cursor_id = self._last_id
         self.stats.events_seen += len(events)
         return events
@@ -305,7 +317,7 @@ class LogStream:
             return None
         try:
             row = db.execute("SELECT MAX(id) AS m FROM logs").fetchone()
-            latest = int(row["m"] or 0) if row else 0
+            latest = (as_finite_int(row["m"]) or 0) if row else 0
             return max(0, latest - self._last_id)
         except sqlite3.Error:
             return None
@@ -314,20 +326,25 @@ class LogStream:
 
     def _row_to_event(self, row: sqlite3.Row) -> RawLogEvent:
         keys = set(row.keys())
-        ts = float(row["ts"]) if "ts" in keys else 0.0
-        ts_nanos = float(row["ts_nanos"]) if "ts_nanos" in keys else 0.0
+        ts = as_finite_float(row["ts"] if "ts" in keys else 0.0)
+        ts_nanos = as_finite_float(row["ts_nanos"] if "ts_nanos" in keys else 0.0)
         timestamp = ts + ts_nanos / 1e9
         thread_id = row["thread_id"] if "thread_id" in keys else None
         process_uuid = row["process_uuid"] if "process_uuid" in keys else None
-        target = row["target"] if "target" in keys else "codex_api::sse::responses"
-        level = row["level"] if "level" in keys else "INFO"
-        body = row["feedback_log_body"] if "feedback_log_body" in keys else ""
+        if thread_id is not None and not isinstance(thread_id, str):
+            thread_id = as_str(thread_id) or None
+        if process_uuid is not None and not isinstance(process_uuid, str):
+            process_uuid = as_str(process_uuid) or None
+        target = as_str(row["target"] if "target" in keys else None) or "codex_api::sse::responses"
+        level = as_str(row["level"] if "level" in keys else None) or "INFO"
+        body = as_text(row["feedback_log_body"] if "feedback_log_body" in keys else "")
+        log_id = as_finite_int(row["id"], 0) or 0
         return parse_log_body(
-            log_id=int(row["id"]),
+            log_id=log_id,
             timestamp=timestamp,
-            target=target or "codex_api::sse::responses",
-            body=body or "",
-            level=level or "INFO",
+            target=target,
+            body=body,
+            level=level,
             process_uuid=process_uuid,
             thread_id=thread_id,
         )

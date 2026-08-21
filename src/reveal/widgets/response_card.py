@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 
+from rich.markup import escape
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical, Horizontal
@@ -19,6 +20,7 @@ from ..models import (
     ResponseStatus,
 )
 from ..routing import display_item_number
+from ..safe import as_dict, as_finite_float, as_str
 from .virtual_content import (
     EMBEDDED_VIEWPORT_ROWS,
     VirtualContentSource,
@@ -50,7 +52,11 @@ def _local_item_time(item: ResponseItemState) -> str:
     """Return the local time of the first event belonging to an item."""
     if not item.events:
         return "--:--:--.---"
-    local = datetime.fromtimestamp(item.events[0].timestamp, tz=CST)
+    try:
+        ts = as_finite_float(item.events[0].timestamp, float("nan"))
+        local = datetime.fromtimestamp(ts, tz=CST)
+    except (OverflowError, ValueError, OSError):
+        return "--:--:--.---"
     return local.strftime("%H:%M:%S.%f")[:-3]
 
 
@@ -220,27 +226,30 @@ class ResponseItemWidget(Vertical):
         local_time = _local_item_time(self.item)
         kind = self.item.kind
         if kind == ItemKind.THINKING:
-            preview = _one_line(self.item.assembled_text) or f"Thinking  events={len(self.item.events)}"
+            preview = escape(_one_line(self.item.assembled_text)) or f"Thinking  events={len(self.item.events)}"
             return f"{local_time}  Thinking  {preview}"
         if kind == ItemKind.TOOL_CALL:
-            name = self.item.tool_name or "?"
+            name = escape(self.item.tool_name or "?")
             status = "running"
             if self.item.tool_result:
-                status = self.item.tool_result.status
+                status = escape(str(self.item.tool_result.status))
             elif self.item.done:
                 status = "result unavailable"
-            args = _one_line(self.item.tool_input, 80)
+            args = escape(_one_line(self.item.tool_input, 80))
             return f"{local_time}  Tool Call: {name}  [{status}]  {args}"
         if kind == ItemKind.ANSWER:
-            preview = _one_line(self.item.assembled_text) or "Answer"
+            preview = escape(_one_line(self.item.assembled_text)) or "Answer"
             return f"{local_time}  Answer  {preview}"
-        return f"{local_time}  Other  {self.item.protocol_type}  events={len(self.item.events)}"
+        return f"{local_time}  Other  {escape(self.item.protocol_type)}  events={len(self.item.events)}"
 
     def _semantic_text(self) -> str:
         if self.item.kind == ItemKind.TOOL_CALL:
-            parts = [f"[bold]Tool[/] {self.item.tool_name or '?'}", f"call_id={self.item.call_id or '?'}"]
+            parts = [
+                f"[bold]Tool[/] {escape(self.item.tool_name or '?')}",
+                f"call_id={escape(self.item.call_id or '?')}",
+            ]
             if self.item.tool_input:
-                parts.append(self.item.tool_input)
+                parts.append(escape(self.item.tool_input))
             return "\n".join(parts)
         if self.item.kind == ItemKind.THINKING:
             if self.item.summary_parts:
@@ -279,11 +288,11 @@ class ResponseItemWidget(Vertical):
         if tr is None:
             return "[dim]rollout-derived result: running / unavailable[/]"
         header = (
-            f"[bold]rollout-derived result[/] status={tr.status}"
+            f"[bold]rollout-derived result[/] status={escape(str(tr.status))}"
             + (f" duration_ms={tr.duration_ms}" if tr.duration_ms is not None else "")
             + (f" exit={tr.exit_code}" if tr.exit_code is not None else "")
         )
-        body = tr.output or tr.summary or ""
+        body = escape(tr.output or tr.summary or "")
         if is_large_content(body):
             return header + f"\n[dim](large output — expand virtual / fullscreen)[/]\n" + body[:500]
         return header + "\n" + body
@@ -333,6 +342,7 @@ class ResponseCard(Vertical):
         self.agent_label = agent_label
         self._item_widgets: dict[str, ResponseItemWidget] = {}
         self._user_collapsed: bool | None = None
+        self._other_widget: Static | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="card-header"):
@@ -402,20 +412,23 @@ class ResponseCard(Vertical):
             else:
                 w.refresh_from_state(item)
 
-        # Other events section
-        other_id = "__other__"
         if state.other_events:
-            # Represent as a synthetic summary static at end
-            existing = body.query(f"#other-{state.response_id}")
             text = self._other_text(state)
-            if existing:
-                existing.first().update(text)
+            if self._other_widget is None:
+                self._other_widget = Static(text, classes="card-other")
+                body.mount(self._other_widget)
             else:
-                body.mount(Static(text, id=f"other-{state.response_id}", classes="card-other"))
+                self._other_widget.update(text)
+        elif self._other_widget is not None:
+            try:
+                self._other_widget.remove()
+            except Exception:
+                pass
+            self._other_widget = None
 
     def _header_text(self) -> str:
         s = self.state
-        color = _model_color(s.model)
+        model = escape(as_str(s.model) or "?")
         status = s.status.value
         status_color = {
             ResponseStatus.ACTIVE: "yellow",
@@ -429,11 +442,15 @@ class ResponseCard(Vertical):
             import time
 
             duration = f"{(end or time.time()) - s.started_at:.1f}s"
-        usage = s.usage or {}
-        token_text = f"in={usage.get('input_tokens', '?')} out={usage.get('output_tokens', '?')}"
-        cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+        usage = as_dict(s.usage)
+        token_text = (
+            f"in={escape(str(usage.get('input_tokens', '?')))} "
+            f"out={escape(str(usage.get('output_tokens', '?')))}"
+        )
+        details = as_dict(usage.get("input_tokens_details"))
+        cached = details.get("cached_tokens", 0)
         if cached:
-            token_text += f" cached={cached}"
+            token_text += f" cached={escape(str(cached))}"
         badges = []
         if s.attribution.confidence == AttributionConfidence.INFERRED:
             badges.append("[yellow]inferred[/]")
@@ -442,12 +459,14 @@ class ResponseCard(Vertical):
         if s.partial:
             badges.append("[dim]partial[/]")
         badge = " ".join(badges)
-        short_id = s.response_id[:20]
+        short_id = escape(as_str(s.response_id)[:20])
+        agent = escape(as_str(self.agent_label))
+        effort = escape(as_str(s.reasoning_effort) or "?")
         return (
-            f"[bold {_model_color(s.model)}]{s.model}[/]  "
+            f"[bold {_model_color(as_str(s.model))}]{model}[/]  "
             f"[{status_color}]{status}[/]  "
-            f"{self.agent_label}  "
-            f"effort={s.reasoning_effort or '?'}  {duration}  {token_text}  "
+            f"{agent}  "
+            f"effort={effort}  {duration}  {token_text}  "
             f"items={len(s.items)}  {badge}  [dim]{short_id}[/]"
         )
 
@@ -458,5 +477,5 @@ class ResponseCard(Vertical):
     def _other_text(self, state: ResponseState) -> str:
         lines = ["[dim]Other (response-level)[/]"]
         for i, ev in enumerate(state.other_events, start=1):
-            lines.append(f"  O.{i}  {ev.event_type}  log_id={ev.log_id}")
+            lines.append(f"  O.{i}  {escape(str(ev.event_type))}  log_id={ev.log_id}")
         return "\n".join(lines)

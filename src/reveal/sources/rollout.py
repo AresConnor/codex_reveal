@@ -11,10 +11,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Iterator, Optional
 
 from ..models import SessionGroup, SessionMeta, ToolResult
+from ..safe import as_aware_utc, as_dict, as_finite_int, as_str
 
 SESSIONS_DIR = os.path.expandvars(r"%USERPROFILE%\.codex\sessions")
 CST = timezone(timedelta(hours=8))
 DEFAULT_SESSION_PAGE = 20
+MAX_TAILER_MAP = 512
 
 
 def canonicalize_workspace(path: str) -> str:
@@ -87,7 +89,10 @@ class SessionCatalog:
         threads: dict[str, SessionMeta] = {}
 
         for filepath in files:
-            meta = _parse_session_meta(filepath)
+            try:
+                meta = _parse_session_meta(filepath)
+            except Exception:
+                continue
             if meta is None:
                 continue
             threads[meta.thread_id] = meta
@@ -254,47 +259,59 @@ from collections.abc import Iterable  # noqa: E402
 def _parse_session_meta(filepath: str) -> Optional[SessionMeta]:
     """Parse the first line of a rollout JSONL file to extract session metadata."""
     try:
-        with open(filepath, encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
             first_line = f.readline().strip()
         if not first_line:
             return None
         data = json.loads(first_line)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return None
 
-    if data.get("type") != "session_meta":
+    if not isinstance(data, dict) or data.get("type") != "session_meta":
         return None
 
     payload = data.get("payload", {})
+    if not isinstance(payload, dict):
+        return None
 
     ts_str = payload.get("timestamp", "")
-    try:
-        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except ValueError:
+    if not isinstance(ts_str, str):
         ts = datetime.min.replace(tzinfo=timezone.utc)
+    else:
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            ts = datetime.min.replace(tzinfo=timezone.utc)
+    ts = as_aware_utc(ts)
 
-    source = payload.get("source", {})
-    subagent = source.get("subagent", {}) if isinstance(source, dict) else {}
-    spawn = subagent.get("thread_spawn", {}) if isinstance(subagent, dict) else {}
+    source = as_dict(payload.get("source"))
+    subagent = as_dict(source.get("subagent"))
+    spawn = as_dict(subagent.get("thread_spawn"))
 
-    rollout_id = payload.get("id", "") or ""
-    session_id = payload.get("session_id", "") or rollout_id
-    parent_thread_id = payload.get("parent_thread_id", "") or ""
-    thread_source = payload.get("thread_source", "user") or "user"
+    rollout_id = as_str(payload.get("id"))
+    session_id = as_str(payload.get("session_id")) or rollout_id
+    if not (rollout_id or session_id):
+        return None
+    parent_thread_id = as_str(payload.get("parent_thread_id"))
+    thread_source = as_str(payload.get("thread_source")) or "user"
+    cwd = as_str(payload.get("cwd"))
+    depth = as_finite_int(spawn.get("depth"), 0)
+    if depth is None or depth < 0:
+        depth = 0
 
     return SessionMeta(
         rollout_id=rollout_id,
         session_id=session_id,
         parent_thread_id=parent_thread_id,
         timestamp=ts,
-        cwd=payload.get("cwd", "") or "",
-        originator=payload.get("originator", "") or "",
-        cli_version=payload.get("cli_version", "") or "",
-        agent_nickname=payload.get("agent_nickname", "") or spawn.get("agent_nickname", "") or "",
-        agent_role=payload.get("agent_role", "") or spawn.get("agent_role", "") or "",
-        agent_path=payload.get("agent_path", "") or spawn.get("agent_path", "") or "",
+        cwd=cwd,
+        originator=as_str(payload.get("originator")),
+        cli_version=as_str(payload.get("cli_version")),
+        agent_nickname=as_str(payload.get("agent_nickname")) or as_str(spawn.get("agent_nickname")),
+        agent_role=as_str(payload.get("agent_role")) or as_str(spawn.get("agent_role")),
+        agent_path=as_str(payload.get("agent_path")) or as_str(spawn.get("agent_path")),
         thread_source=thread_source,
-        depth=int(spawn.get("depth", 0) or 0),
+        depth=depth,
         file_path=filepath,
         thread_id=rollout_id or session_id,
     )
@@ -304,15 +321,17 @@ def read_rollout(filepath: str) -> list[dict]:
     """Read all events from a rollout JSONL file."""
     events: list[dict] = []
     try:
-        with open(filepath, encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    events.append(json.loads(line))
+                    obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(obj, dict):
+                    events.append(obj)
     except OSError:
         pass
     return events
@@ -345,11 +364,11 @@ class RolloutTailer:
             return results
 
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(self.offset)
                 chunk = f.read()
                 self.offset = f.tell()
-        except OSError:
+        except (OSError, UnicodeError):
             return results
 
         data = self._carry + chunk
@@ -375,12 +394,16 @@ class RolloutTailer:
                 # Only re-carry if this was the final logical line situation; for
                 # mid-file invalid lines, skip (corrupt history).
                 continue
+            if not isinstance(obj, dict):
+                continue
             for result in self._extract_tool_events(obj):
                 results.append(result)
         return results
 
     def _extract_tool_events(self, obj: dict[str, Any]) -> list[ToolResult]:
         out: list[ToolResult] = []
+        if not isinstance(obj, dict):
+            return out
         typ = obj.get("type")
         payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
 
@@ -394,6 +417,8 @@ class RolloutTailer:
                 "tool_call",
             ):
                 self._invocations[call_id] = payload
+                if len(self._invocations) > MAX_TAILER_MAP:
+                    self._invocations.pop(next(iter(self._invocations)))
                 if call_id not in self._outputs:
                     result = ToolResult(
                         call_id=call_id,
@@ -402,6 +427,8 @@ class RolloutTailer:
                         summary="running",
                     )
                     self._outputs[call_id] = result
+                    if len(self._outputs) > MAX_TAILER_MAP:
+                        self._outputs.pop(next(iter(self._outputs)))
                     out.append(result)
             return out
 
@@ -423,10 +450,7 @@ class RolloutTailer:
                 except (TypeError, ValueError):
                     duration_ms = None
                 exit_code = payload.get("exit_code")
-                try:
-                    exit_code_i = int(exit_code) if exit_code is not None else None
-                except (TypeError, ValueError):
-                    exit_code_i = None
+                exit_code_i = as_finite_int(exit_code)
                 inv = self._invocations.get(call_id) or {}
                 result = ToolResult(
                     call_id=call_id,
@@ -439,5 +463,7 @@ class RolloutTailer:
                     source="rollout",
                 )
                 self._outputs[call_id] = result
+                if len(self._outputs) > MAX_TAILER_MAP:
+                    self._outputs.pop(next(iter(self._outputs)))
                 out.append(result)
         return out

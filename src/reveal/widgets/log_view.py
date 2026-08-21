@@ -6,6 +6,7 @@ from datetime import timezone, timedelta
 import os
 import time
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.widgets import TabbedContent, TabPane, RichLog, Label
@@ -23,6 +24,7 @@ from ..models import (
     WorkspaceScope,
 )
 from ..routing import ResponseRouter
+from ..safe import as_dict, as_finite_int, as_str
 from ..sources.log_stream import LogStream
 from ..sources.rollout import SessionCatalog, read_rollout
 from .response_feed import ResponseFeed
@@ -35,21 +37,17 @@ CST = timezone(timedelta(hours=8))
 
 def format_history_token_line(last_token_usage: dict) -> str:
     """Format History token_count line with optional cache hit rate."""
-    last = last_token_usage or {}
-    in_tok = last.get("input_tokens", "?")
-    cached = last.get("cached_input_tokens", "?")
-    out_tok = last.get("output_tokens", "?")
+    last = as_dict(last_token_usage)
+    in_tok = escape(str(last.get("input_tokens", "?")))
+    cached = escape(str(last.get("cached_input_tokens", "?")))
+    out_tok = escape(str(last.get("output_tokens", "?")))
     parts = [
         f"tokens: in={in_tok}",
         f"cached={cached}",
         f"out={out_tok}",
     ]
-    try:
-        in_n = int(last.get("input_tokens"))
-        cached_n = int(last.get("cached_input_tokens") or 0)
-    except (TypeError, ValueError):
-        in_n = 0
-        cached_n = 0
+    in_n = as_finite_int(last.get("input_tokens"), 0) or 0
+    cached_n = as_finite_int(last.get("cached_input_tokens"), 0) or 0
     if in_n > 0:
         rate_pct = (cached_n / in_n) * 100.0
         parts.append(f"cached_rate={rate_pct:.1f}%")
@@ -126,14 +124,14 @@ class LogView(Container):
         self._history_file_sig = None
         hist_log = self.query_one("#history-log", RichLog)
         hist_log.clear()
-        name = meta.agent_nickname or "root"
-        role = meta.agent_role or ""
+        name = escape(meta.agent_nickname or "root")
+        role = escape(meta.agent_role or "")
         hist_log.write("[bold cyan]" + "=" * 50 + "[/]")
         hist_log.write(f"[bold]  {name}[/]" + (f" [dim]({role})[/]" if role else ""))
         hist_log.write(
-            f"[dim]  {meta.timestamp.strftime('%Y-%m-%d %H:%M:%S')}  thread={meta.thread_id[:16]}...[/]"
+            f"[dim]  {meta.timestamp.strftime('%Y-%m-%d %H:%M:%S')}  thread={escape(meta.thread_id[:16])}...[/]"
         )
-        hist_log.write(f"[dim]  {meta.cwd}[/]")
+        hist_log.write(f"[dim]  {escape(meta.cwd)}[/]")
         hist_log.write("[dim]" + "=" * 50 + "[/]\n")
         try:
             events = read_rollout(meta.file_path)
@@ -144,6 +142,8 @@ class LogView(Container):
             self._history_event_count = 0
             return
         for ev in events:
+            if not isinstance(ev, dict):
+                continue
             if ev.get("type") == "event_msg":
                 self._write_event_msg(hist_log, ev.get("payload", {}))
             elif ev.get("type") == "response_item":
@@ -295,6 +295,8 @@ class LogView(Container):
             return
         hist_log = self.query_one("#history-log", RichLog)
         for ev in events[self._history_event_count :]:
+            if not isinstance(ev, dict):
+                continue
             if ev.get("type") == "event_msg":
                 self._write_event_msg(hist_log, ev.get("payload", {}))
             elif ev.get("type") == "response_item":
@@ -328,36 +330,47 @@ class LogView(Container):
         if suspicious:
             diag_log.write("\n[bold underline]Recent Suspicious Responses:[/]")
             for rs in reversed(suspicious):
-                diag_log.write(
-                    f"  {rs.model:<15} {rs.reasoning_effort or '-':<7} "
-                    f"Sc={rs.suspicion_score:>3} WS={rs.whitespace_ratio:.0%} "
-                    f"Tokx={rs.token_inflation:.1f} TPS={rs.effective_tps:.0f} "
-                    f"{' '.join(rs.flags[:4])}"
-                )
+                try:
+                    diag_log.write(
+                        f"  {escape(as_str(rs.model)):<15} {escape(as_str(rs.reasoning_effort) or '-'):<7} "
+                        f"Sc={rs.suspicion_score:>3} WS={rs.whitespace_ratio:.0%} "
+                        f"Tokx={rs.token_inflation:.1f} TPS={rs.effective_tps:.0f} "
+                        f"{' '.join(rs.flags[:4])}"
+                    )
+                except Exception:
+                    continue
         if a.responses:
             diag_log.write("\n[bold underline]In-Flight:[/]")
             for rid, rs in a.responses.items():
                 if rs.delta_count:
                     diag_log.write(
-                        f"  {rs.model[:12]:<12} {rs.delta_count:>4}d "
-                        f"WS={rs.whitespace_ratio:.0%} avg={rs.avg_delta_size:.0f} rid={rid[:16]}"
+                        f"  {escape(as_str(rs.model))[:12]:<12} {rs.delta_count:>4}d "
+                        f"WS={rs.whitespace_ratio:.0%} avg={rs.avg_delta_size:.0f} rid={escape(as_str(rid))[:16]}"
                     )
 
     def _write_event_msg(self, log: RichLog, payload: dict) -> None:
+        payload = as_dict(payload)
         ptype = payload.get("type", "")
         if ptype == "agent_message":
-            log.write(f"[bold green]agent:[/] {payload.get('message', '')}")
+            log.write(f"[bold green]agent:[/] {escape(as_str(payload.get('message')))}")
         elif ptype == "user_message":
-            log.write(f"[bold cyan]user:[/] {payload.get('message', '')[:200]}")
+            log.write(f"[bold cyan]user:[/] {escape(as_str(payload.get('message'))[:200])}")
         elif ptype == "token_count":
-            last = (payload.get("info") or {}).get("last_token_usage") or {}
+            info = as_dict(payload.get("info"))
+            last = as_dict(info.get("last_token_usage"))
             log.write(format_history_token_line(last))
         elif ptype == "task_complete":
-            log.write(f"[dim]task completed in {payload.get('duration_ms', 0)}ms[/]")
+            log.write(f"[dim]task completed in {escape(str(payload.get('duration_ms', 0)))}ms[/]")
 
     def _write_response_item(self, log: RichLog, payload: dict) -> None:
-        if payload.get("role") == "assistant":
-            for content in payload.get("content", []):
-                if content.get("type") == "output_text" and content.get("text"):
-                    text = content["text"].replace("[", "\\[")
-                    log.write(text)
+        payload = as_dict(payload)
+        if payload.get("role") != "assistant":
+            return
+        content = payload.get("content", [])
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "output_text" and isinstance(block.get("text"), str) and block["text"]:
+                log.write(escape(block["text"]))

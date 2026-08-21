@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.message import Message
 from textual.widgets import Static, Tree
 from textual.widgets.tree import TreeNode
-
 from ..models import (
     AgentScope,
     LoadOlderScope,
@@ -22,7 +22,6 @@ from ..models import (
 from ..sources.rollout import (
     SessionCatalog,
     canonicalize_workspace,
-    workspace_label,
 )
 
 CST = timezone(timedelta(hours=8))
@@ -97,9 +96,8 @@ class SessionTree(Vertical):
             path = self.catalog.workspace_paths.get(ws_key, ws_key)
             base = (path.rstrip("\\/").split("\\")[-1].split("/")[-1]) if path else ws_key
             collide = base.lower() in collisions
-            label = workspace_label(path or ws_key, collide=collide)
-            # Strip markup for tree label safety — Tree uses plain/rich mixed; keep simple
-            plain_label = base if not collide else f"{base} ({path})"
+            # Tree parses Rich markup; untrusted path components must be escaped.
+            plain_label = escape(base) if not collide else escape(f"{base} ({path})")
             ws_node = tree.root.add(plain_label, data=WorkspaceScope(workspace_key=ws_key))
             if ws_key in self._expanded_workspaces:
                 ws_node.expand()
@@ -180,8 +178,9 @@ def _session_time_label(ts: datetime, today) -> str:
 
 
 def _agent_label(agent: SessionMeta, *, closed: bool = False) -> str:
-    name = agent.agent_nickname or "root"
-    role = agent.agent_role or ("" if name == "root" else agent.thread_source)
+    name = escape(agent.agent_nickname or "root")
+    role_raw = agent.agent_role or ("" if (agent.agent_nickname or "root") == "root" else agent.thread_source)
+    role = escape(role_raw) if role_raw else ""
     if role and name != "root":
         label = f"{name}    {role}"
     else:

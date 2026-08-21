@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [Unreleased]
+
+### Fixed
+
+- Crash-hardening for untrusted local Codex logs (`docs/security-audit-crash.md` F1–F11): skip malformed session/JSONL/SSE records instead of raising; coerce nested types; `utf-8` `errors="replace"` on rollout reads; escape Rich markup at render; stop interpolating `response_id` into CSS queries; clamp out-of-range timestamps; cap router/analyzer/tailer/card growth (including hung ACTIVE cards).
+
 ## [1.0.0] - 2026-07-17
 
 First stable release of **Reveal** — a Textual TUI for Codex Desktop logs and live Responses API SSE.

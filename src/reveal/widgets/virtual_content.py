@@ -35,6 +35,7 @@ class VirtualContentSource:
     rows: list[str] = field(default_factory=list)
     _width: int = 80
     _wrap_cache: dict[int, list[str]] = field(default_factory=dict)
+    _total_display: int | None = None
 
     @classmethod
     def from_text(cls, text: str) -> "VirtualContentSource":
@@ -57,12 +58,14 @@ class VirtualContentSource:
     def append_row(self, row: str) -> None:
         self.rows.append(row)
         self._wrap_cache.pop(len(self.rows) - 1, None)
+        self._total_display = None
 
     def set_width(self, width: int) -> None:
         width = max(1, width)
         if width != self._width:
             self._width = width
             self._wrap_cache.clear()
+            self._total_display = None
 
     def wrapped_lines_for_row(self, idx: int) -> list[str]:
         if idx in self._wrap_cache:
@@ -79,10 +82,12 @@ class VirtualContentSource:
         return lines
 
     def total_display_lines(self) -> int:
-        total = 0
-        for i in range(len(self.rows)):
-            total += len(self.wrapped_lines_for_row(i))
-        return total
+        if self._total_display is None:
+            total = 0
+            for i in range(len(self.rows)):
+                total += len(self.wrapped_lines_for_row(i))
+            self._total_display = total
+        return self._total_display
 
     def iter_display(self) -> Iterable[tuple[int, int, str]]:
         """Yield (row_index, subline_index, text)."""

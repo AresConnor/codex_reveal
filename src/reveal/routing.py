@@ -25,6 +25,7 @@ from .models import (
     ToolResult,
     UnresolvedEvent,
 )
+from .safe import as_dict, as_finite_int, as_text
 
 # Observed but non-contractual: item/response ids often share a generation family.
 # Real shapes: resp_<hex>, msg_<hex>, rs_<hex>, ctc_<hex>, item_<hex>
@@ -36,6 +37,9 @@ _FAMILY_LEN = 24
 # Long-running Live sessions previously froze the UI because feed() re-scanned
 # the entire unresolved list on every event (O(events × unresolved × responses)).
 MAX_UNRESOLVED = 5000
+MAX_RESPONSES = 1000
+MAX_ITEM_EVENTS = 200
+MAX_OTHER_EVENTS = 100
 
 # Concurrent subagents share process_uuid; attribute SSE only when a single
 # thread was recently active for that process (avoids false assignment).
@@ -78,10 +82,7 @@ def extract_item_fields(parsed: dict[str, Any]) -> tuple[str | None, int | None,
     if output_index is None:
         output_index = item.get("output_index")
     if output_index is not None:
-        try:
-            output_index = int(output_index)
-        except (TypeError, ValueError):
-            output_index = None
+        output_index = as_finite_int(output_index)
     return item_id, output_index, item
 
 
@@ -96,7 +97,7 @@ def parse_log_body(
     thread_id: str | None = None,
 ) -> RawLogEvent:
     """Parse a relevant log row into a RawLogEvent without mutating body text."""
-    raw_body = body if body is not None else ""
+    raw_body = as_text(body)
     parsed: dict[str, Any] = {}
     event_type = "other"
     sequence_number = None
@@ -107,45 +108,47 @@ def parse_log_body(
     if raw_body.startswith("SSE event:"):
         payload = raw_body[len("SSE event:") :].lstrip()
         try:
-            parsed = json.loads(payload)
+            loaded = json.loads(payload)
         except json.JSONDecodeError:
             parsed = {}
             event_type = "malformed_sse"
         else:
-            event_type = str(parsed.get("type") or "unknown")
-            sequence_number = parsed.get("sequence_number")
-            if sequence_number is not None:
-                try:
-                    sequence_number = int(sequence_number)
-                except (TypeError, ValueError):
-                    sequence_number = None
-            response_id = extract_response_id(parsed)
-            item_id, output_index, _item = extract_item_fields(parsed)
-            if response_id is None and item_id is None and output_index is None:
-                # Keep non-standard but relevant SSE-ish rows inspectable.
-                pass
+            if not isinstance(loaded, dict):
+                parsed = {}
+                event_type = "malformed_sse"
+            else:
+                parsed = loaded
+                event_type = str(parsed.get("type") or "unknown")
+                sequence_number = as_finite_int(parsed.get("sequence_number"))
+                response_id = extract_response_id(parsed)
+                item_id, output_index, _item = extract_item_fields(parsed)
     elif raw_body.startswith("unhandled responses event:"):
         event_type = "unhandled_responses_event"
-        # Keep body verbatim; try to pull a type token if present.
         rest = raw_body[len("unhandled responses event:") :].strip()
         try:
-            parsed = json.loads(rest)
-            event_type = str(parsed.get("type") or event_type)
-            response_id = extract_response_id(parsed)
-            item_id, output_index, _item = extract_item_fields(parsed)
+            loaded = json.loads(rest)
         except json.JSONDecodeError:
             parsed = {"raw": rest}
+        else:
+            if not isinstance(loaded, dict):
+                parsed = {}
+            else:
+                parsed = loaded
+                event_type = str(parsed.get("type") or event_type)
+                response_id = extract_response_id(parsed)
+                item_id, output_index, _item = extract_item_fields(parsed)
     else:
         event_type = "non_sse"
-        # Optional: thread-bound request/client rows may be plain text/json.
         try:
-            parsed = json.loads(raw_body)
-            if isinstance(parsed, dict):
+            loaded = json.loads(raw_body)
+        except json.JSONDecodeError:
+            parsed = {}
+        else:
+            if isinstance(loaded, dict):
+                parsed = loaded
                 response_id = extract_response_id(parsed)
                 item_id, output_index, _item = extract_item_fields(parsed)
                 event_type = str(parsed.get("type") or event_type)
-        except json.JSONDecodeError:
-            parsed = {}
 
     return RawLogEvent(
         log_id=log_id,
@@ -291,6 +294,7 @@ class ResponseRouter:
         old_thread = state.agent_thread_id
 
         self._apply_event(state, event)
+        self._trim_responses()
         self._maybe_attribute(state, event)
 
         reassigned: list[tuple[str, str | None, str | None]] = []
@@ -416,34 +420,69 @@ class ResponseRouter:
         self.responses[response_id] = state
         return state
 
+    def _trim_responses(self) -> None:
+        overflow = len(self.responses) - MAX_RESPONSES
+        if overflow <= 0:
+            return
+        victims: list[str] = []
+        for rid, state in self.responses.items():
+            if state.status != ResponseStatus.ACTIVE:
+                victims.append(rid)
+                if len(victims) >= overflow:
+                    break
+        if len(victims) < overflow:
+            for rid in self.responses:
+                if rid not in victims:
+                    victims.append(rid)
+                if len(victims) >= overflow:
+                    break
+        for rid in victims:
+            self._drop_response(rid)
+
+    def _drop_response(self, rid: str) -> None:
+        state = self.responses.pop(rid, None)
+        if state is None:
+            return
+        for item in state.items.values():
+            self.item_index.pop(item.item_id, None)
+            if item.call_id:
+                self.call_index.pop(item.call_id, None)
+        for key, value in list(self.family_index.items()):
+            if value == rid:
+                del self.family_index[key]
+        self.next_sequence.pop(rid, None)
+
     def _apply_event(self, state: ResponseState, event: RawLogEvent) -> None:
         typ = event.event_type
-        parsed = event.parsed
+        parsed = as_dict(event.parsed)
 
         if typ == "response.created":
-            response = parsed.get("response") or {}
-            state.model = str(response.get("model", state.model) or state.model).replace(
-                "gpt-", ""
-            )
-            reasoning = response.get("reasoning") or {}
-            if isinstance(reasoning, dict):
-                effort = reasoning.get("effort")
-                if effort is not None:
-                    state.reasoning_effort = str(effort)
+            response = as_dict(parsed.get("response"))
+            model = response.get("model", state.model)
+            if isinstance(model, str) and model:
+                state.model = model.replace("gpt-", "")
+            reasoning = as_dict(response.get("reasoning"))
+            effort = reasoning.get("effort")
+            if effort is not None:
+                state.reasoning_effort = str(effort)
             state.status = ResponseStatus.ACTIVE
             state.started_at = event.timestamp or state.started_at
             state.partial = False
             state.other_events.append(event)
+            if len(state.other_events) > MAX_OTHER_EVENTS:
+                del state.other_events[:-MAX_OTHER_EVENTS]
             if event.sequence_number is not None:
                 self.next_sequence[state.response_id] = event.sequence_number + 1
             return
 
         if typ in ("response.completed", "response.failed", "response.incomplete"):
-            response = parsed.get("response") or {}
-            if isinstance(response, dict):
-                state.usage = response.get("usage") or state.usage
-                if response.get("model"):
-                    state.model = str(response.get("model")).replace("gpt-", "")
+            response = as_dict(parsed.get("response"))
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                state.usage = usage
+            model = response.get("model")
+            if isinstance(model, str) and model:
+                state.model = model.replace("gpt-", "")
             state.ended_at = event.timestamp
             if typ == "response.completed":
                 state.status = ResponseStatus.COMPLETED
@@ -452,11 +491,15 @@ class ResponseRouter:
             else:
                 state.status = ResponseStatus.INCOMPLETE
             state.other_events.append(event)
+            if len(state.other_events) > MAX_OTHER_EVENTS:
+                del state.other_events[:-MAX_OTHER_EVENTS]
             return
 
         item_id, output_index, item = extract_item_fields(parsed)
         if item_id is None and output_index is None:
             state.other_events.append(event)
+            if len(state.other_events) > MAX_OTHER_EVENTS:
+                del state.other_events[:-MAX_OTHER_EVENTS]
             return
 
         # Ensure item id for indexing
@@ -541,7 +584,8 @@ class ResponseRouter:
                 item_state.assembled_text += delta
 
         item_state.events.append(event)
-
+        if len(item_state.events) > MAX_ITEM_EVENTS:
+            del item_state.events[:-MAX_ITEM_EVENTS]
         if event.sequence_number is not None:
             self.next_sequence[state.response_id] = event.sequence_number + 1
 
@@ -556,11 +600,8 @@ class ResponseRouter:
 
     @staticmethod
     def _summary_index(parsed: dict[str, Any]) -> int:
-        idx = parsed.get("summary_index")
-        try:
-            return int(idx) if idx is not None else 0
-        except (TypeError, ValueError):
-            return 0
+        idx = as_finite_int(parsed.get("summary_index"), 0)
+        return 0 if idx is None else idx
 
     @staticmethod
     def _join_summary_parts(parts: dict[int, str]) -> str:

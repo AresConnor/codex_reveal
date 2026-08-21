@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
@@ -233,8 +234,8 @@ class RevealApp(App):
         # Do NOT force tab switch
         if isinstance(event.scope, AgentScope):
             meta = self.catalog.get_thread(event.scope.thread_id)
-            name = (meta.agent_nickname if meta else None) or event.scope.thread_id[:12]
-            self._set_status(f"Scope: agent {name}")
+            name = (meta.agent_nickname if meta else None) or str(event.scope.thread_id)[:12]
+            self._set_status(f"Scope: agent {escape(name)}")
         else:
             self._set_status(f"Scope: {type(event.scope).__name__}")
 
